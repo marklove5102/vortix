@@ -1,0 +1,1293 @@
+use crate::app::{App, ConnectionState, InputMode, Protocol};
+use ratatui::{
+    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        canvas::{Canvas, Line as CanvasLine},
+        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table,
+    },
+    Frame,
+};
+
+use super::widgets;
+use crate::constants;
+use crate::message;
+use crate::theme;
+use crate::utils;
+
+/// Render the dashboard view
+pub fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    // 1. Technical Header (1 row)
+    // 2. Main Content (Flexible)
+    // 3. Command Footer (1 row)
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    render_cockpit_header(frame, app, chunks[0]);
+    widgets::footer::render_dashboard(frame, app, chunks[2]);
+
+    // Main Content: Left Sidebar (Profiles + Details) | Right Workspace
+    // Expanded sidebar from 25% to 32% for better Connection Details display
+    let main_layout = Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(chunks[1]);
+
+    // Sidebar: Profiles (Top) | Connection Details (Bottom)
+    let sidebar_layout = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(main_layout[0]);
+
+    render_profiles_sidebar(frame, app, sidebar_layout[0]);
+    render_connection_details(frame, app, sidebar_layout[1]);
+
+    // Right Workspace: Top (Chart) | Bottom (Security + Logs)
+    let workspace_chunks =
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(main_layout[1]);
+
+    render_throughput_chart(frame, app, workspace_chunks[0]);
+
+    // Bottom Dash: Left (Security Guard) | Right (Event Log)
+    let dash_chunks = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(workspace_chunks[1]);
+
+    render_security_guard(frame, app, dash_chunks[0]);
+    render_activity_log(frame, app, dash_chunks[1]);
+
+    // Register Click Areas
+    app.panel_areas
+        .insert(crate::app::FocusedPanel::Sidebar, sidebar_layout[0]);
+    app.panel_areas.insert(
+        crate::app::FocusedPanel::ConnectionDetails,
+        sidebar_layout[1],
+    );
+    app.panel_areas
+        .insert(crate::app::FocusedPanel::Chart, workspace_chunks[0]);
+    app.panel_areas
+        .insert(crate::app::FocusedPanel::Security, dash_chunks[0]);
+    app.panel_areas
+        .insert(crate::app::FocusedPanel::Logs, dash_chunks[1]);
+
+    render_overlays(frame, app);
+
+    // Render Zoomed Panel Overlay (if active)
+    if let Some(panel) = &app.zoomed_panel {
+        let area = centered_rect(90, 90, frame.area());
+        frame.render_widget(ratatui::widgets::Clear, area); // Clear background
+
+        // Render the zoomed panel
+        match panel {
+            crate::app::FocusedPanel::Sidebar => render_profiles_sidebar(frame, app, area),
+            crate::app::FocusedPanel::ConnectionDetails => {
+                render_connection_details(frame, app, area);
+            }
+            crate::app::FocusedPanel::Chart => render_throughput_chart(frame, app, area),
+            crate::app::FocusedPanel::Security => render_security_guard(frame, app, area),
+            crate::app::FocusedPanel::Logs => render_activity_log(frame, app, area),
+        }
+    }
+}
+
+fn render_overlays(frame: &mut Frame, app: &mut App) {
+    // Overlays still take priority
+    match &app.input_mode {
+        InputMode::DependencyError { protocol, missing } => {
+            render_dependency_alert(frame, *protocol, missing);
+        }
+        InputMode::PermissionDenied { action } => render_permission_denied(frame, action),
+        InputMode::Import { path, cursor } => render_import_overlay(frame, path, *cursor),
+        InputMode::ConfirmDelete {
+            name,
+            confirm_selected,
+            ..
+        } => render_delete_confirm(frame, name, *confirm_selected),
+        InputMode::Normal => {}
+    }
+
+    if app.show_config {
+        super::overlays::config_viewer::render(frame, app);
+    }
+
+    if app.show_action_menu || app.show_bulk_menu {
+        let (actions, title) = if app.show_bulk_menu {
+            (message::get_bulk_actions(), " Bulk Actions ")
+        } else {
+            (message::get_single_actions(&app.focused_panel), " Actions ")
+        };
+
+        super::overlays::action_menu::render(frame, &actions, &mut app.action_menu_state, title);
+    }
+}
+
+/// Helper to center a rect
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([Constraint::Percentage(percent_y)]).flex(Flex::Center);
+    let horizontal = Layout::horizontal([Constraint::Percentage(percent_x)]).flex(Flex::Center);
+
+    let [area] = vertical.areas(area);
+    let [area] = horizontal.areas(area);
+    area
+}
+
+fn render_import_overlay(frame: &mut Frame, path: &str, cursor: usize) {
+    let area = frame.area();
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage(30),
+        Constraint::Percentage(40),
+        Constraint::Percentage(30),
+    ])
+    .split(area);
+
+    let popup_area = Layout::horizontal([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .split(popup_layout[1])[1];
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .title(constants::TITLE_IMPORT_PROFILE)
+        .title_bottom(Line::from(constants::TITLE_IMPORT_FOOTER).centered());
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let before = path.chars().take(cursor).collect::<String>();
+    let cursor_char = path
+        .chars()
+        .nth(cursor)
+        .map_or_else(|| "█".to_string(), |c| c.to_string());
+    let after = path.chars().skip(cursor + 1).collect::<String>();
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            constants::PROMPT_IMPORT_PATH,
+            Style::default().fg(theme::TEXT_PRIMARY),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" > ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(
+                cursor_char,
+                Style::default()
+                    .fg(theme::ACCENT_SECONDARY)
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+            Span::styled(after, Style::default().fg(theme::TEXT_PRIMARY)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            constants::HINT_IMPORT_BULK,
+            Style::default().fg(theme::ACCENT_SECONDARY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            constants::LABEL_SUPPORTED_FORMATS,
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("  {}", constants::EXT_CONF),
+                Style::default().fg(theme::NORD_PURPLE),
+            ),
+            Span::styled(
+                format!(" → {}", constants::PROTO_WIREGUARD),
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("  {}", constants::EXT_OVPN),
+                Style::default().fg(theme::WARNING),
+            ),
+            Span::styled(
+                format!(" → {}", constants::PROTO_OPENVPN),
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
+}
+
+fn render_cockpit_header(frame: &mut Frame, app: &App, area: Rect) {
+    let (status_text, color, profile_name, _location_text, _iface_text, since) =
+        get_connection_info(app);
+
+    // Compact uptime format: ▲HH:MM or ▲MM:SS for < 1 hour
+    let uptime = if let Some(s) = since {
+        let elapsed = s.elapsed();
+        let secs = elapsed.as_secs();
+        if secs >= 3600 {
+            format!("▲{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+        } else {
+            format!("▲{:02}:{:02}", secs / 60, secs % 60)
+        }
+    } else {
+        "▲--:--".to_string()
+    };
+
+    let ks_indicator = get_killswitch_indicator(app);
+    let line = Line::from(vec![
+        Span::styled(
+            status_text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ({profile_name})"),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(&app.public_ip, Style::default().fg(theme::TEXT_PRIMARY)),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(uptime, Style::default().fg(theme::ACCENT_SECONDARY)),
+        Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        ks_indicator,
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn get_connection_info(
+    app: &App,
+) -> (
+    &'static str,
+    Color,
+    &str,
+    &str,
+    &str,
+    Option<std::time::Instant>,
+) {
+    match &app.connection_state {
+        ConnectionState::Disconnected => {
+            ("○ DISCONNECTED", theme::ERROR, "None", "None", "-", None)
+        }
+        ConnectionState::Connecting { profile, .. } => {
+            ("◐ CONNECTING", theme::WARNING, profile, "...", "...", None)
+        }
+        ConnectionState::Disconnecting { profile, .. } => (
+            "◑ DISCONNECTING",
+            theme::WARNING,
+            profile,
+            "...",
+            "...",
+            None,
+        ),
+        ConnectionState::Connected {
+            profile,
+            since,
+            details,
+            ..
+        } => (
+            "● CONNECTED",
+            theme::SUCCESS,
+            profile,
+            &app.location,
+            &details.interface,
+            Some(*since),
+        ),
+    }
+}
+
+/// Get kill switch indicator for the header bar.
+/// Self-explanatory labels: KS:Off, KS:Auto, KS:Strict, KS:BLOCK
+fn get_killswitch_indicator(app: &App) -> Span<'static> {
+    use crate::state::{KillSwitchMode, KillSwitchState};
+
+    match (app.killswitch_mode, app.killswitch_state) {
+        // Kill switch is OFF
+        (KillSwitchMode::Off, _) | (_, KillSwitchState::Disabled) => {
+            Span::styled(" KS:Off ", Style::default().fg(theme::INACTIVE))
+        }
+        // BLOCKING - critical state, user needs to know internet is blocked
+        (_, KillSwitchState::Blocking) => Span::styled(
+            " KS:BLOCK ",
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // Auto mode - armed and monitoring
+        (KillSwitchMode::Auto, KillSwitchState::Armed) => {
+            Span::styled(" KS:Auto ", Style::default().fg(theme::SUCCESS))
+        }
+        // Strict mode - armed and monitoring
+        (KillSwitchMode::AlwaysOn, KillSwitchState::Armed) => {
+            Span::styled(" KS:Strict ", Style::default().fg(theme::WARNING))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_profiles_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Sidebar);
+    let border_style = if is_focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_DEFAULT)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(" Profiles ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.profiles.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No profiles found").alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let active_profile = match &app.connection_state {
+        ConnectionState::Connected { profile, .. }
+        | ConnectionState::Connecting { profile, .. }
+        | ConnectionState::Disconnecting { profile, .. } => Some(profile.clone()),
+        ConnectionState::Disconnected => None,
+    };
+
+    let items: Vec<Row> = app
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(idx, p)| {
+            let is_selected = app.profile_list_state.selected() == Some(idx);
+            let is_active = active_profile.as_ref() == Some(&p.name);
+            let is_never_used = p.last_used.is_none();
+
+            // Collapsed Status Slot
+            let (status_char, status_color) = if is_active {
+                (" ●", theme::SUCCESS)
+            } else {
+                ("  ", Color::Reset)
+            };
+
+            let name_style = if is_selected {
+                Style::default()
+                    .fg(theme::ROW_SELECTED_FG)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active {
+                Style::default().fg(theme::SUCCESS)
+            } else if is_never_used {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(theme::INACTIVE)
+            };
+
+            // Metadata on the right
+            let proto_char = match p.protocol {
+                crate::app::Protocol::WireGuard => "W",
+                crate::app::Protocol::OpenVPN => "O",
+            };
+            let proto_color = if is_active {
+                theme::SUCCESS
+            } else if is_selected {
+                theme::ACCENT_PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
+            };
+
+            let time_str = if let Some(last_used) = p.last_used {
+                utils::format_relative_time(last_used)
+            } else {
+                String::new()
+            };
+
+            // Fixed meta widths for column alignment
+            let proto_width = 1;
+            let time_width = 4;
+            let padding_right = 1; // Add 1 space padding from right border
+            let meta_width = proto_width + 1 + time_width + padding_right; // Protocol + space + Time + Padding
+
+            let prefix_width = 3; // status(2) + space(1)
+            let name_width = p.name.len();
+
+            let avail_width = (inner.width as usize).saturating_sub(prefix_width);
+            let padding_width = avail_width.saturating_sub(name_width + meta_width);
+            let padding = " ".repeat(padding_width);
+
+            let final_spans = vec![
+                Span::styled(status_char, Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(&p.name, name_style),
+                Span::raw(padding),
+                Span::styled(proto_char, Style::default().fg(proto_color)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{time_str:>time_width$}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(" "), // Right padding
+            ];
+
+            let row_style = if is_selected {
+                Style::default().bg(theme::ROW_SELECTED_BG)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![Cell::from(Line::from(final_spans))]).style(row_style)
+        })
+        .collect();
+
+    let table = Table::new(items, [Constraint::Min(0)]);
+    frame.render_stateful_widget(table, inner, &mut app.profile_list_state);
+
+    // Scrollbar Logic
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
+        .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
+
+    let mut scrollbar_state =
+        ScrollbarState::new(app.profiles.len().saturating_sub(inner.height as usize))
+            .position(app.profile_list_state.selected().unwrap_or(0));
+
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scrollbar_state,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Chart);
+    let border_style = if is_focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_DEFAULT)
+    };
+
+    // Peak detection for dynamic Y-axis scaling (calculate first for title)
+    let max_down = app.down_history.iter().map(|(_, y)| *y).fold(0.0, f64::max);
+    let max_up = app.up_history.iter().map(|(_, y)| *y).fold(0.0, f64::max);
+    let peak = (max_down.max(max_up) * 1.2).max(1024.0 * 1024.0 * 0.5);
+    let peak_label = format!(" Peak: {:.1} MB/s ", peak / 1024.0 / 1024.0);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(" Network Throughput ")
+        .title(
+            Line::from(Span::styled(
+                peak_label,
+                Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+            ))
+            .right_aligned(),
+        );
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Layout: Stats (Top) | Chart (Bottom)
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+
+    // 1. Render Numeric Stats (Top row)
+    let stats_line = Line::from(vec![
+        Span::styled(" ▲ UP: ", Style::default().fg(theme::NORD_GREEN)),
+        Span::styled(
+            format!("{:<10}", utils::format_bytes_speed(app.current_up)),
+            Style::default().fg(theme::TEXT_PRIMARY),
+        ),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(" ▼ DOWN: ", Style::default().fg(theme::NORD_FROST_2)),
+        Span::styled(
+            format!("{:<10}", utils::format_bytes_speed(app.current_down)),
+            Style::default().fg(theme::TEXT_PRIMARY),
+        ),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(" ⇌ PING: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            format!("{}ms", app.latency_ms),
+            Style::default().fg(if app.latency_ms == 0 {
+                theme::TEXT_SECONDARY // Not measured yet
+            } else if app.latency_ms < 50 {
+                theme::NORD_GREEN // Excellent
+            } else if app.latency_ms < 150 {
+                theme::NORD_YELLOW // Good
+            } else {
+                theme::NORD_RED // Poor
+            }),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(stats_line).alignment(Alignment::Center),
+        chunks[0],
+    );
+
+    let canvas = Canvas::default()
+        .block(Block::default())
+        .x_bounds([0.0, 60.0])
+        .y_bounds([0.0, peak])
+        .paint(|ctx| {
+            // Draw Streams
+            for i in 0..app.down_history.len() - 1 {
+                let y1 = app.down_history[i].1;
+                let y2 = app.down_history[i + 1].1;
+
+                // Skip drawing if both points are zero to avoid messy Braille dots
+                if y1 > 0.0 || y2 > 0.0 {
+                    ctx.draw(&CanvasLine {
+                        x1: app.down_history[i].0,
+                        y1,
+                        x2: app.down_history[i + 1].0,
+                        y2,
+                        color: theme::ACCENT_PRIMARY, // Frost Blue
+                    });
+                }
+            }
+            for i in 0..app.up_history.len() - 1 {
+                let y1 = app.up_history[i].1;
+                let y2 = app.up_history[i + 1].1;
+
+                // Skip drawing if both points are zero to avoid messy Braille dots
+                if y1 > 0.0 || y2 > 0.0 {
+                    ctx.draw(&CanvasLine {
+                        x1: app.up_history[i].0,
+                        y1,
+                        x2: app.up_history[i + 1].0,
+                        y2,
+                        color: theme::SUCCESS, // Aurora Green
+                    });
+                }
+            }
+        });
+
+    frame.render_widget(canvas, chunks[1]);
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_security_guard(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Security);
+    let border_style = if is_focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_DEFAULT)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(" Security Guard ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Security checks
+    let is_connected = !matches!(app.connection_state, ConnectionState::Disconnected);
+    let ipv6_leaking = app.ipv6_leak;
+
+    if !is_connected {
+        // Disconnected state - show warning
+        let audit = vec![
+            Line::from(vec![Span::styled(
+                " ⚠ EXPOSED ",
+                Style::default()
+                    .bg(theme::WARNING)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Your traffic is unencrypted.",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            )),
+            Line::from(Span::styled(
+                "Connect to a VPN profile.",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(audit), inner);
+        return;
+    }
+
+    // Connected - show security checklist with visual indicators
+    let dns_leaking = app.dns_server.starts_with("192.168.") || app.dns_server.starts_with("172.1");
+
+    // Check if IP is actually masked (different from real IP captured when disconnected)
+    let ip_status = match &app.real_ip {
+        Some(real)
+            if !app.public_ip.is_empty()
+                && app.public_ip != constants::MSG_DETECTING
+                && app.public_ip != constants::MSG_FETCHING
+                && !app.public_ip.starts_with("Error") =>
+        {
+            if &app.public_ip == real {
+                (false, true) // LEAK! same IP as real
+            } else {
+                (true, false) // masked (different IP)
+            }
+        }
+        _ => (false, false), // unknown (still checking)
+    };
+    let (ip_masked, ip_leaking) = ip_status;
+
+    // Security checklist with pass/fail indicators
+    let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
+    let check_fail = Span::styled("✗ ", Style::default().fg(theme::ERROR));
+    let check_warn = Span::styled("● ", Style::default().fg(theme::WARNING));
+
+    // Truncate values to fit panel
+    let max_val = inner.width.saturating_sub(10) as usize;
+
+    let audit = vec![
+        // IP Masked - compare with real IP
+        Line::from(vec![
+            if ip_masked {
+                check_pass.clone()
+            } else if ip_leaking {
+                check_fail.clone()
+            } else {
+                check_warn.clone()
+            },
+            Span::styled("IP   ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                utils::truncate(&app.public_ip, max_val),
+                Style::default().fg(if ip_masked {
+                    theme::SUCCESS
+                } else if ip_leaking {
+                    theme::ERROR
+                } else {
+                    theme::WARNING
+                }),
+            ),
+        ]),
+        // DNS Check
+        Line::from(vec![
+            if dns_leaking {
+                check_fail.clone()
+            } else {
+                check_pass.clone()
+            },
+            Span::styled("DNS  ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                utils::truncate(&app.dns_server, max_val),
+                Style::default().fg(if dns_leaking {
+                    theme::ERROR
+                } else {
+                    theme::SUCCESS
+                }),
+            ),
+        ]),
+        // IPv6 Check
+        Line::from(vec![
+            if ipv6_leaking {
+                check_fail.clone()
+            } else {
+                check_pass.clone()
+            },
+            Span::styled("IPv6 ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                if ipv6_leaking { "Leaking" } else { "Blocked" },
+                Style::default().fg(if ipv6_leaking {
+                    theme::ERROR
+                } else {
+                    theme::SUCCESS
+                }),
+            ),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(audit), inner);
+}
+
+fn render_dependency_alert(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
+    let area = frame.area();
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage(25),
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+    ])
+    .split(area);
+
+    let popup_area = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+    ])
+    .split(popup_layout[1])[1];
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" System Dependency Missing ");
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(8),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let pkg = if protocol == Protocol::WireGuard {
+        "wireguard-tools"
+    } else {
+        "openvpn"
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " ERROR: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "Missing system tools required for {protocol} sessions."
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" Missing: "),
+            Span::styled(missing.join(", "), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::raw(
+            " To fix this, please run the following in your terminal:",
+        )]),
+        Line::from(vec![Span::styled(
+            format!(" brew install {pkg}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" Press "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to return to dashboard."),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), chunks[1]);
+}
+
+fn render_permission_denied(frame: &mut Frame, action: &str) {
+    let area = frame.area();
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage(25),
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+    ])
+    .split(area);
+
+    let popup_area = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+    ])
+    .split(popup_layout[1])[1];
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Elevated Privileges Required ");
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(8),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " ACCESS DENIED: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{} needs root privileges to {action}.",
+                constants::APP_NAME
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::raw(
+            " VPN management involves modifying network interfaces and routes,",
+        )]),
+        Line::from(vec![Span::raw(" which is a privileged system operation.")]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(format!(
+                " Recommendation: Restart {} with ",
+                constants::APP_NAME
+            )),
+            Span::styled(
+                format!("sudo {}", constants::APP_NAME),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" Press "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to return to dashboard."),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), chunks[1]);
+}
+
+fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) {
+    let area = frame.area();
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage(40),
+        Constraint::Percentage(20),
+        Constraint::Percentage(40),
+    ])
+    .split(area);
+
+    let popup_area = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+    ])
+    .split(popup_layout[1])[1];
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ERROR))
+        .title(" Confirm Deletion ");
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let yes_style = if confirm_selected {
+        Style::default()
+            .bg(theme::ROW_SELECTED_BG)
+            .fg(theme::ROW_SELECTED_FG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::ROW_SELECTED_FG)
+    };
+
+    let no_style = if confirm_selected {
+        Style::default().fg(theme::NORD_POLAR_NIGHT_4)
+    } else {
+        Style::default()
+            .bg(theme::NORD_POLAR_NIGHT_4)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Are you sure you want to delete "),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("?"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Y] Yes, Delete ", yes_style),
+            Span::raw("    "),
+            Span::styled(" [N] Cancel ", no_style),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Logs);
+    let border_style = if is_focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_DEFAULT)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(" Event Log ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.logs.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No activity yet").alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    // Calculate how many logs we can show (1 log per line, no wrapping)
+    let visible_lines = inner.height as usize;
+
+    // Get the last N logs that fit in the panel (auto-scroll behavior)
+    let start_idx = if app.logs_auto_scroll {
+        app.logs.len().saturating_sub(visible_lines)
+    } else {
+        app.logs_scroll as usize
+    };
+
+    let end_idx = (start_idx + visible_lines).min(app.logs.len());
+
+    let logs: Vec<Line> = app.logs[start_idx..end_idx]
+        .iter()
+        .map(|msg| {
+            let (timestamp, content) = if let Some(idx) = msg.find(' ') {
+                (&msg[..idx], &msg[idx + 1..])
+            } else {
+                ("", msg.as_str())
+            };
+
+            // Truncate content to fit panel width (timestamp ~10 chars + brackets)
+            let max_content_len = inner.width.saturating_sub(13) as usize;
+            let truncated_content = if content.len() > max_content_len {
+                format!("{}…", &content[..max_content_len.saturating_sub(1)])
+            } else {
+                content.to_string()
+            };
+
+            let style = if content.contains("Error")
+                || content.contains("Failed")
+                || content.contains("LEAK")
+                || content.contains("leak")
+            {
+                Style::default().fg(theme::ERROR)
+            } else if content.contains("Connected")
+                || content.contains("SUCCESS")
+                || content.contains("established")
+                || content.contains("secure")
+                || content.contains("Masked")
+            {
+                Style::default().fg(theme::SUCCESS)
+            } else if content.contains("ACTION")
+                || content.contains("CMD")
+                || content.contains("starting")
+                || content.contains("stopping")
+            {
+                Style::default().fg(theme::ACCENT_SECONDARY)
+            } else if content.contains("WARN")
+                || content.contains("spike")
+                || content.contains("⚠")
+                || content.contains("non-zero")
+            {
+                Style::default().fg(theme::WARNING)
+            } else if content.contains("NET:") || content.contains("SEC:") {
+                Style::default().fg(theme::NORD_FROST_3)
+            } else {
+                Style::default().fg(theme::INACTIVE)
+            };
+
+            Line::from(vec![
+                Span::styled(
+                    format!("[{timestamp}] "),
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ),
+                Span::styled(truncated_content, style),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(logs), inner);
+
+    // Scrollbar Logic
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"))
+        .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
+        .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
+
+    let mut scrollbar_state =
+        ScrollbarState::new(app.logs.len().saturating_sub(visible_lines)).position(start_idx);
+
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(ratatui::layout::Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scrollbar_state,
+    );
+}
+
+// === Helper Utilities ===
+
+#[allow(clippy::too_many_lines)]
+fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
+    let border_style = if is_focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_DEFAULT)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(" Connection Details ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if let ConnectionState::Connected { details, .. } = &app.connection_state {
+        let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
+
+        let mut text = vec![
+            // Row 1: Net Info (IP + Iface)
+            Line::from(vec![
+                Span::styled("IP/If   : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(
+                    &details.internal_ip,
+                    Style::default()
+                        .fg(theme::ACCENT_PRIMARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " ({})",
+                        if details.interface.is_empty() {
+                            "-"
+                        } else {
+                            &details.interface
+                        }
+                    ),
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ),
+            ]),
+            // Row 2: Server Endpoint (Dedicated Line)
+            Line::from(vec![
+                Span::styled("Remote  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(&details.endpoint, Style::default().fg(theme::TEXT_PRIMARY)),
+            ]),
+            // Row 3: ISP | Location
+            Line::from(vec![
+                Span::styled("ISP/Loc : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(
+                    utils::truncate(&app.isp, 12),
+                    Style::default().fg(theme::TEXT_PRIMARY),
+                ),
+                Span::styled(" (", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(
+                    utils::truncate(&app.location, 10),
+                    Style::default().fg(theme::TEXT_PRIMARY),
+                ),
+                Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
+            ]),
+        ];
+
+        // Row 4: Protocol Info
+        let (proto_label, proto_value, proto_color) = if is_openvpn {
+            let cipher = if details.latest_handshake.starts_with("Cipher:") {
+                details.latest_handshake.replace("Cipher: ", "")
+            } else if details.latest_handshake.is_empty() {
+                "AES-256-GCM".to_string()
+            } else {
+                details.latest_handshake.clone()
+            };
+            ("Cipher  : ", cipher, theme::NORD_YELLOW)
+        } else {
+            (
+                "Shake   : ",
+                details.latest_handshake.clone(),
+                theme::NORD_YELLOW,
+            )
+        };
+
+        if proto_value.is_empty() {
+            // Placeholder to maintain grid
+            text.push(Line::from(vec![
+                Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("-", Style::default().fg(proto_color)),
+            ]));
+        } else {
+            text.push(Line::from(vec![
+                Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(proto_value, Style::default().fg(proto_color)),
+            ]));
+        }
+
+        // Row 5: Transfer Stats
+        text.push(Line::from(vec![
+            Span::styled("Xfer    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("↓", Style::default().fg(theme::NORD_FROST_3)),
+            Span::styled(
+                if details.transfer_rx.is_empty() {
+                    "0"
+                } else {
+                    &details.transfer_rx
+                },
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+            Span::styled(" ↑", Style::default().fg(theme::NORD_GREEN)),
+            Span::styled(
+                if details.transfer_tx.is_empty() {
+                    "0"
+                } else {
+                    &details.transfer_tx
+                },
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+        ]));
+
+        text.push(Line::from(""));
+
+        // Row 6: Quality Metrics (Unified high-density)
+        let quality_status = if app.packet_loss >= 5.0 || app.jitter_ms >= 15 {
+            ("POOR", theme::NORD_RED)
+        } else if app.packet_loss >= 1.0 || app.jitter_ms >= 5 {
+            ("FAIR", theme::NORD_YELLOW)
+        } else {
+            ("EXCELLENT", theme::NORD_GREEN)
+        };
+
+        text.push(Line::from(vec![
+            Span::styled("Quality: ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                quality_status.0,
+                Style::default()
+                    .fg(quality_status.1)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        text.push(Line::from(vec![
+            Span::styled(
+                "  ├─ Ping (Latency)   : ",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+            Span::styled(
+                format!("{}ms", app.latency_ms),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+        ]));
+
+        text.push(Line::from(vec![
+            Span::styled(
+                "  ├─ Stability (Jitter): ",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+            Span::styled(
+                format!("±{}ms", app.jitter_ms),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+        ]));
+
+        text.push(Line::from(vec![
+            Span::styled(
+                "  └─ Reliability (Loss): ",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ),
+            Span::styled(
+                format!("{:.1}%", app.packet_loss),
+                Style::default().fg(if app.packet_loss < 1.0 {
+                    theme::NORD_GREEN
+                } else {
+                    theme::NORD_RED
+                }),
+            ),
+        ]));
+
+        // Stats Footer Row
+        text.push(Line::from(""));
+        let rel_spans = vec![
+            Span::styled("Stats   : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("PID ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                details.pid.map_or("-".to_string(), |p| p.to_string()),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+            Span::styled(" | Drops ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                format!("{}", app.connection_drops),
+                Style::default().fg(if app.connection_drops > 0 {
+                    theme::NORD_RED
+                } else {
+                    theme::TEXT_PRIMARY
+                }),
+            ),
+        ];
+
+        text.push(Line::from(rel_spans));
+
+        frame.render_widget(Paragraph::new(text), inner);
+    } else {
+        // Show pre-connect info when disconnected
+        let mut text = vec![
+            Line::from(Span::styled(
+                "Not Connected",
+                Style::default().fg(theme::INACTIVE),
+            )),
+            Line::from(""),
+        ];
+
+        // Show selected profile info with pre-connect ping
+        if let Some(idx) = app.profile_list_state.selected() {
+            if let Some(profile) = app.profiles.get(idx) {
+                text.push(Line::from(vec![
+                    Span::styled("Selected: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(&profile.name, Style::default().fg(theme::ACCENT_PRIMARY)),
+                ]));
+                text.push(Line::from(vec![
+                    Span::styled("Protocol: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(
+                        profile.protocol.to_string(),
+                        Style::default().fg(theme::TEXT_PRIMARY),
+                    ),
+                ]));
+                text.push(Line::from(vec![
+                    Span::styled("Location: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled(&profile.location, Style::default().fg(theme::TEXT_PRIMARY)),
+                ]));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(text), inner);
+    }
+}

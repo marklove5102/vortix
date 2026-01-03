@@ -1,0 +1,20 @@
+[workspace]
+# Changelog configuration
+changelog_config = "cliff.toml"
+
+# PR settings
+pr_labels = ["release"]
+
+# Git settings  
+git_release_enable = true
+git_release_draft = false
+# Tag format: "v" prefix (matches cargo-dist trigger pattern)
+git_tag_name = "v{{ version }}"
+
+# Publish to crates.io
+publish = true
+
+[[package]]
+name = "vortix"
+# Use conventional commits to determine version bump
+semver_check = true

@@ -1,0 +1,231 @@
+//! Message system for the Vortix application.
+//!
+//! All state mutations flow through this centralized Message enum,
+//! following the Elm Architecture (TEA) pattern. This enables:
+//! - Easy debugging (log all messages)
+//! - Predictable state changes
+//! - Testable update logic
+
+use crate::core::scanner::ActiveSession;
+use crate::core::telemetry::TelemetryUpdate;
+use crate::state::{FocusedPanel, ToastType};
+
+/// All messages that can modify application state.
+///
+/// Messages are the single source of truth for state mutations.
+/// They can originate from user input or programmatically.
+/// Direction for list selection movement
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMove {
+    Next,
+    Prev,
+    First,
+    Last,
+}
+
+/// Direction for scrolling movement
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+/// All messages that can modify application state.
+///
+/// Messages are the single source of truth for state mutations.
+/// They can originate from user input or programmatically.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Some variants are handled in match but not constructed externally
+pub enum Message {
+    // === Navigation ===
+    /// Focus next panel
+    NextPanel,
+    /// Focus previous panel
+    PreviousPanel,
+    /// Focus a specific panel
+    FocusPanel(FocusedPanel),
+    /// Toggle zoom on current panel
+    ToggleZoom,
+
+    // === Profile Management ===
+    /// Move selection in profile list
+    ProfileMove(SelectionMove),
+
+    // === Connection ===
+    /// Toggle connection for profile at index (None = selected)
+    ToggleConnect(Option<usize>),
+    /// Disconnect from current VPN
+    Disconnect,
+    /// Reconnect to last profile
+    Reconnect,
+    /// Connect to quick slot (0-8)
+    QuickConnect(usize),
+
+    // === UI Overlays ===
+    /// Close current overlay (Action menu, Help, Config, etc.)
+    CloseOverlay,
+    /// Show toast notification
+    Toast(String, ToastType),
+    /// View config for selected profile
+    OpenConfig,
+    /// Request delete for profile at index
+    OpenDelete(Option<usize>),
+    /// Confirm deletion
+    ConfirmDelete,
+
+    // === Action Menu ===
+    /// Open the action menu (Single actions)
+    OpenActionMenu,
+    /// Open the bulk action menu
+    OpenBulkMenu,
+
+    // === Scrolling ===
+    /// Scroll current context
+    Scroll(ScrollMove),
+
+    // === Import ===
+    /// Open import dialog
+    OpenImport,
+
+    // === System ===
+    /// Log a message
+    Log(String),
+    /// Copy IP to clipboard
+    CopyIp,
+    /// Clear activity logs
+    ClearLogs,
+    /// Quit the application
+    Quit,
+    /// Background telemetry update
+    Telemetry(TelemetryUpdate),
+    /// Periodic system state synchronization (active profiles)
+    SyncSystemState(Vec<ActiveSession>),
+    /// Periodic heartbeat tick
+    Tick,
+    /// Connection timeout detected
+    ConnectionTimeout(String),
+    /// Terminal resize event
+    Resize(u16, u16),
+    /// Import profile from path
+    Import(String),
+
+    // === Kill Switch ===
+    /// Toggle kill switch mode (Off → Auto → `AlwaysOn` → Off)
+    ToggleKillSwitch,
+}
+
+/// An item in the action menu, mapping a key to a message.
+#[derive(Debug, Clone)]
+pub struct ActionMenuItem {
+    /// The key that triggers this action
+    pub key: &'static str,
+    /// Human-readable label for the action
+    pub label: &'static str,
+    /// The message to dispatch
+    pub message: Message,
+}
+
+/// Get specific actions for the focused item/panel (triggered by 'x')
+pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
+    let mut actions = Vec::new();
+
+    // 1. Panel-Specific Actions
+    match focused_panel {
+        FocusedPanel::Sidebar => {
+            actions.push(ActionMenuItem {
+                key: "i",
+                label: "Import Profiles",
+                message: Message::OpenImport,
+            });
+            actions.push(ActionMenuItem {
+                key: "c",
+                label: "Connect / Disconnect",
+                message: Message::ToggleConnect(None),
+            });
+            actions.push(ActionMenuItem {
+                key: "r",
+                label: "Reconnect Selected",
+                message: Message::Reconnect,
+            });
+            actions.push(ActionMenuItem {
+                key: "v",
+                label: "View Configuration",
+                message: Message::OpenConfig,
+            });
+            actions.push(ActionMenuItem {
+                key: "DEL",
+                label: "Delete Profile",
+                message: Message::OpenDelete(None),
+            });
+        }
+        FocusedPanel::Logs => {
+            actions.push(ActionMenuItem {
+                key: "L",
+                label: "Clear Activity Logs",
+                message: Message::ClearLogs,
+            });
+        }
+        FocusedPanel::ConnectionDetails => {
+            actions.push(ActionMenuItem {
+                key: "y",
+                label: "Copy Public IP",
+                message: Message::CopyIp,
+            });
+        }
+        FocusedPanel::Security | FocusedPanel::Chart => {
+            // No specific panel actions yet for Security Guard or Chart
+        }
+    }
+
+    // 2. Universal Contextual Utility
+    actions.push(ActionMenuItem {
+        key: "z",
+        label: "Toggle Zoom View",
+        message: Message::ToggleZoom,
+    });
+
+    actions
+}
+
+/// Get bulk/global actions (triggered by 'b')
+pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
+    vec![
+        ActionMenuItem {
+            key: "i",
+            label: "Import Profiles",
+            message: Message::OpenImport,
+        },
+        ActionMenuItem {
+            key: "r",
+            label: "Reconnect All",
+            message: Message::Reconnect,
+        },
+        ActionMenuItem {
+            key: "D",
+            label: "Disconnect All",
+            message: Message::Disconnect,
+        },
+        ActionMenuItem {
+            key: "y",
+            label: "Copy Public IP",
+            message: Message::CopyIp,
+        },
+        ActionMenuItem {
+            key: "l",
+            label: "Next Panel",
+            message: Message::NextPanel,
+        },
+        ActionMenuItem {
+            key: "h",
+            label: "Previous Panel",
+            message: Message::PreviousPanel,
+        },
+        ActionMenuItem {
+            key: "q",
+            label: "Quit Vortix",
+            message: Message::Quit,
+        },
+    ]
+}
