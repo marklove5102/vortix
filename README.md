@@ -100,6 +100,10 @@ cargo test          # Run unit/integration tests
 cargo clippy        # Enforce code quality (Fail-fast via pre-commit)
 ```
 
+## Featured In
+
+- [Terminal Trove](https://terminaltrove.com/vortix/) — The $HOME of all things in the terminal
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.com/#Harry-kp/vortix&Date)
