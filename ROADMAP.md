@@ -68,8 +68,8 @@ Vortix is currently in **beta**. Core functionality is stable and actively used 
 
 ## 🤝 How to Contribute
 
-1. **Vote on features** — React with 👍 on [GitHub Issues](https://github.com/Harry-kp/vortix/issues)
-2. **Discuss ideas** — Use [GitHub Discussions](https://github.com/Harry-kp/vortix/discussions)
+1. **Vote on features** — React with 👍 on [Feature Requests](https://github.com/Harry-kp/vortix/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement)
+2. **Propose ideas** — Start a thread in [GitHub Discussions](https://github.com/Harry-kp/vortix/discussions)
 3. **Submit PRs** — See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Versioning Policy
