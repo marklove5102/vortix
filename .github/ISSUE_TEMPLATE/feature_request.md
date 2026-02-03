@@ -1,23 +1,20 @@
 ---
 name: Feature Request
 about: Suggest an idea for Vortix
-title: '[FEATURE] '
+title: '[Feature] '
 labels: enhancement
 assignees: ''
 ---
 
-## Problem Statement
-A clear description of the problem or limitation you're experiencing.
-Example: "I'm always frustrated when [...]"
+## Problem
+What problem does this solve? 
+Example: "I'm always frustrated when..."
 
 ## Proposed Solution
-A clear description of what you want to happen.
+How should this work?
 
 ## Alternatives Considered
-Any alternative solutions or features you've considered.
-
-## Use Case
-Describe your use case and how this feature would help.
+Any other approaches you've thought about.
 
 ## Additional Context
-Any mockups, screenshots, or examples from other tools.
+Screenshots, mockups, or links to similar features in other tools.

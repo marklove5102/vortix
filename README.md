@@ -10,7 +10,7 @@ Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
 
 ![Vortix Demo](assets/demo.gif)
 
-## Why?
+## Why Vortix?
 
 I wanted a single interface to:
 - See connection status, throughput, and latency at a glance
@@ -18,6 +18,16 @@ I wanted a single interface to:
 - Switch between VPN profiles without remembering CLI flags
 
 Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time telemetry or require a GUI.
+
+| Feature | Vortix | GUI Clients | CLI-only |
+|---------|:------:|:-----------:|:--------:|
+| Memory usage | ~15MB | 200-500MB | ~5MB |
+| Startup time | <100ms | 2-5s | Instant |
+| Real-time telemetry | ✅ | ✅ | ❌ |
+| Leak detection | ✅ | Some | ❌ |
+| Kill switch | ✅ | ✅ | Manual |
+| Keyboard-driven | ✅ | ❌ | ✅ |
+| Works over SSH | ✅ | ❌ | ✅ |
 
 ## Features
 

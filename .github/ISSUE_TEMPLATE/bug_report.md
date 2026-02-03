@@ -1,33 +1,32 @@
 ---
 name: Bug Report
 about: Report a bug to help us improve
-title: '[BUG] '
+title: '[Bug] '
 labels: bug
 assignees: ''
 ---
 
-## Description
-A clear and concise description of the bug.
+## Describe the Bug
+A clear description of what the bug is.
 
-## Environment
-- **macOS Version**: [e.g., 14.2 Sonoma]
-- **Vortix Version**: [run `vortix --version`]
-- **VPN Protocol**: [WireGuard / OpenVPN / Both]
-- **Terminal**: [e.g., iTerm2, Terminal.app, Alacritty]
-
-## Steps to Reproduce
-1. Go to '...'
-2. Press '...'
+## To Reproduce
+Steps to reproduce:
+1. Run `sudo vortix`
+2. Do '...'
 3. See error
 
 ## Expected Behavior
 What you expected to happen.
 
-## Actual Behavior
-What actually happened.
+## Environment
+- **OS:** macOS [version]
+- **Vortix version:** [e.g., 0.2.0]
+- **VPN type:** WireGuard / OpenVPN
+- **Install method:** cargo install / binary / source
 
-## Screenshots / Logs
-If applicable, add screenshots or terminal output.
+## Logs / Screenshots
+If applicable, add logs or screenshots.
 
-## Additional Context
-Any other relevant information.
+```
+Paste any error messages here
+```
