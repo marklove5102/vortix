@@ -56,7 +56,7 @@ pub enum Message {
     // === Connection ===
     /// Toggle connection for profile at index (None = selected)
     ToggleConnect(Option<usize>),
-    /// Disconnect from current VPN
+    /// Disconnect from current VPN (press again while disconnecting to force-kill)
     Disconnect,
     /// Reconnect to last profile
     Reconnect,
@@ -106,6 +106,24 @@ pub enum Message {
     Tick,
     /// Connection timeout detected
     ConnectionTimeout(String),
+    /// Result from the background connect thread
+    ConnectResult {
+        /// Profile name that was being connected
+        profile: String,
+        /// Whether the connect command succeeded
+        success: bool,
+        /// Error message if the command failed
+        error: Option<String>,
+    },
+    /// Result from the background disconnect thread
+    DisconnectResult {
+        /// Profile name that was being disconnected
+        profile: String,
+        /// Whether the disconnect command succeeded
+        success: bool,
+        /// Error message if the command failed
+        error: Option<String>,
+    },
     /// Terminal resize event
     Resize(u16, u16),
     /// Import profile from path

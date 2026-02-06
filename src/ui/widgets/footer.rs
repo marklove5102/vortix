@@ -43,7 +43,7 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     hints.extend_from_slice(&[
         ("i", "Import"),
         ("d", "Disconnect"),
-        ("Tab", "Switch Panel"),
+        ("Tab", "Panel"),
         ("K", "Kill Switch"),
         ("x", "Menu"),
         ("q", "Quit"),

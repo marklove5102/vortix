@@ -89,6 +89,8 @@ pub struct App {
     pub is_root: bool,
     /// Number of connection drops detected this session.
     pub connection_drops: u32,
+    /// Profile index queued for auto-connect after current disconnect completes.
+    pub pending_connect: Option<usize>,
 
     // === Kill Switch ===
     /// Kill switch operating mode (Off, Auto, `AlwaysOn`).
@@ -148,6 +150,7 @@ impl App {
             terminal_size: (0, 0),
             is_root: utils::is_root(),
             connection_drops: 0,
+            pending_connect: None,
 
             // Kill switch - load from persisted state for crash recovery
             killswitch_mode: crate::state::KillSwitchMode::default(),
@@ -733,11 +736,64 @@ impl App {
             },
 
             // Connection
-            Message::Disconnect => self.disconnect(),
+            Message::Disconnect => {
+                if matches!(self.connection_state, ConnectionState::Disconnecting { .. }) {
+                    self.force_disconnect();
+                } else {
+                    self.disconnect();
+                }
+            }
             Message::Reconnect => self.reconnect(),
             Message::QuickConnect(idx) => {
                 if idx < self.profiles.len() {
                     self.toggle_connection(idx);
+                }
+            }
+
+            // Disconnect result from background thread
+            Message::DisconnectResult {
+                profile,
+                success,
+                error,
+            } => {
+                if success {
+                    self.complete_disconnect(&profile);
+                } else {
+                    let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
+                    self.log(&format!(
+                        "CMD_ERR: Failed to disconnect '{profile}': {err_msg}"
+                    ));
+                    // Clear pending -- don't auto-connect after a failed disconnect
+                    self.pending_connect = None;
+                    // Revert to Disconnected so the scanner can re-detect if VPN is still running
+                    if matches!(self.connection_state, ConnectionState::Disconnecting { .. }) {
+                        self.connection_state = ConnectionState::Disconnected;
+                    }
+                    self.show_toast(format!("Failed to disconnect: {err_msg}"), ToastType::Error);
+                    self.sync_killswitch();
+                }
+            }
+
+            // Connect result from background thread
+            Message::ConnectResult {
+                profile,
+                success,
+                error,
+            } => {
+                if success {
+                    self.log(&format!("CMD: Successfully started VPN for '{profile}'"));
+                    // Keep state as Connecting -- the scanner will promote to Connected
+                    // once the interface appears.
+                } else {
+                    let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
+                    self.log(&format!(
+                        "CMD_ERR: Failed to connect '{profile}': {err_msg}"
+                    ));
+                    self.connection_state = ConnectionState::Disconnected;
+                    self.session_start = None;
+                    self.show_toast(format!("Failed to connect: {err_msg}"), ToastType::Error);
+                    // Drain pending_connect on failure (don't auto-connect)
+                    self.pending_connect = None;
                 }
             }
 
@@ -926,18 +982,38 @@ impl App {
                 }
             }
             Message::SyncSystemState(active) => {
-                // Debounce: Don't let scanner override Disconnecting back to Connected
+                // Guard: While Disconnecting, the scanner must NEVER override to Connected.
+                // Only two exits: (1) interface disappears -> Disconnected, or
+                // (2) 30s safety timeout -> Disconnected with warning.
+                // The primary path is via DisconnectResult from the background thread.
                 if let ConnectionState::Disconnecting { started, profile } = &self.connection_state
                 {
-                    if started.elapsed().as_secs() < 5 {
-                        if !active.iter().any(|s| &s.name == profile) {
-                            let profile_name = profile.clone();
-                            self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-                            self.connection_state = ConnectionState::Disconnected;
-                            self.session_start = None;
-                        }
-                        return;
+                    let elapsed = started.elapsed().as_secs();
+                    let interface_gone = !active.iter().any(|s| &s.name == profile);
+
+                    if interface_gone {
+                        // Interface disappeared -- confirm disconnection and drain pending
+                        let profile_name = profile.clone();
+                        self.complete_disconnect(&profile_name);
+                    } else if elapsed >= 30 {
+                        // Safety timeout: VPN teardown is taking too long
+                        let profile_name = profile.clone();
+                        self.log(&format!(
+                            "WARN: Disconnect timed out for '{profile_name}' after 30s"
+                        ));
+                        // Clear pending -- don't auto-connect when the previous VPN may still be running
+                        self.pending_connect = None;
+                        self.connection_state = ConnectionState::Disconnected;
+                        self.session_start = None;
+                        self.show_toast(
+                            "Disconnect timed out — VPN process may still be running".to_string(),
+                            ToastType::Warning,
+                        );
+                        self.sync_killswitch();
                     }
+                    // Always return: never fall through to the general scanner logic
+                    // while in Disconnecting state.
+                    return;
                 }
 
                 // Debounce: Don't let scanner override Connecting back to Disconnected
@@ -1358,35 +1434,37 @@ impl App {
         // Update quick slots logic removed - key `1` now maps to index `0` dynamically
     }
 
-    /// Smart connection toggle: Connect, Disconnect, or Switch
+    /// Smart connection toggle: Connect, Disconnect, or Switch.
+    ///
+    /// Uses `pending_connect` to queue a connection that fires automatically
+    /// after the current disconnect completes, avoiding the race condition
+    /// of starting connect while disconnect is still in-flight.
     fn toggle_connection(&mut self, idx: usize) {
         if let Some(target_profile) = self.profiles.get(idx) {
+            let target_name = target_profile.name.clone();
             match &self.connection_state {
                 // If connecting, ignore to prevent races
-                ConnectionState::Connecting { .. } => {
-                    self.show_toast("Connection in progress...".to_string(), ToastType::Info);
-                }
-                // If disconnecting, ignore to prevent races
+                ConnectionState::Connecting { .. } => {}
+                // If disconnecting, queue the connection for after disconnect completes
                 ConnectionState::Disconnecting { .. } => {
-                    self.show_toast("Disconnection in progress...".to_string(), ToastType::Info);
+                    self.pending_connect = Some(idx);
                 }
                 // If connected...
                 ConnectionState::Connected {
                     profile: current_name,
                     ..
                 } => {
-                    if current_name == &target_profile.name {
-                        // Same profile -> Disconnect
+                    if *current_name == target_name {
+                        // Same profile -> Disconnect (toggle off)
+                        self.pending_connect = None;
                         self.disconnect();
                     } else {
-                        // Different profile -> Switch (Disconnect then Connect)
-                        // Note: Because disconnect is synchronous (waits for process),
-                        // we can validly call connect immediately after.
+                        // Different profile -> Queue switch: disconnect first, connect after
+                        self.pending_connect = Some(idx);
                         self.disconnect();
-                        self.connect_profile(idx);
                     }
                 }
-                // If disconnected -> Connect
+                // If disconnected -> Connect immediately
                 ConnectionState::Disconnected => {
                     self.connect_profile(idx);
                 }
@@ -1480,20 +1558,26 @@ impl App {
 
             match output {
                 Ok(out) if out.status.success() => {
-                    let _ = cmd_tx.send(Message::Log(format!(
-                        "CMD: Successfully started {protocol} for '{name}'"
-                    )));
+                    let _ = cmd_tx.send(Message::ConnectResult {
+                        profile: name,
+                        success: true,
+                        error: None,
+                    });
                 }
                 Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let msg = format!("Failed to start {protocol} for '{name}': {stderr}");
-                    let _ = cmd_tx.send(Message::Toast(format!("Error: {msg}"), ToastType::Error));
-                    let _ = cmd_tx.send(Message::Log(format!("CMD_ERR: {msg}")));
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let _ = cmd_tx.send(Message::ConnectResult {
+                        profile: name,
+                        success: false,
+                        error: Some(format!("{protocol}: {stderr}")),
+                    });
                 }
                 Err(e) => {
-                    let msg = format!("Failed to execute {protocol} command for '{name}': {e}");
-                    let _ = cmd_tx.send(Message::Toast(format!("Error: {msg}"), ToastType::Error));
-                    let _ = cmd_tx.send(Message::Log(format!("CMD_ERR: {msg}")));
+                    let _ = cmd_tx.send(Message::ConnectResult {
+                        profile: name,
+                        success: false,
+                        error: Some(format!("Failed to execute {protocol}: {e}")),
+                    });
                 }
             }
         });
@@ -1564,15 +1648,35 @@ impl App {
         );
     }
 
+    /// Finalize a disconnect: transition to `Disconnected`, sync kill switch,
+    /// and drain `pending_connect` (auto-connect to the queued profile, if any).
+    fn complete_disconnect(&mut self, profile_name: &str) {
+        self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
+        self.connection_state = ConnectionState::Disconnected;
+        self.session_start = None;
+        self.sync_killswitch();
+
+        // Drain pending_connect: auto-connect to the queued profile
+        if let Some(idx) = self.pending_connect.take() {
+            if idx < self.profiles.len() {
+                let next_name = self.profiles[idx].name.clone();
+                self.log(&format!(
+                    "ACTION: Auto-connecting to queued profile '{next_name}'"
+                ));
+                self.connect_profile(idx);
+            }
+        }
+    }
+
     fn disconnect(&mut self) {
-        // Clone needed data to release borrow on self
-        let connection_info = if let ConnectionState::Connected {
-            profile: ref profile_name,
-            details,
-            ..
-        } = &self.connection_state
-        {
-            self.profiles
+        // Extract connection info from Connected or Connecting state
+        let connection_info = match &self.connection_state {
+            ConnectionState::Connected {
+                profile: ref profile_name,
+                details,
+                ..
+            } => self
+                .profiles
                 .iter()
                 .find(|p| p.name == *profile_name)
                 .map(|profile| {
@@ -1583,9 +1687,24 @@ impl App {
                         details.pid,
                         self.cmd_tx.clone(),
                     )
-                })
-        } else {
-            None
+                }),
+            ConnectionState::Connecting {
+                profile: ref profile_name,
+                ..
+            } => self
+                .profiles
+                .iter()
+                .find(|p| p.name == *profile_name)
+                .map(|profile| {
+                    (
+                        profile.name.clone(),
+                        profile.protocol,
+                        profile.config_path.clone(),
+                        None, // no PID yet while connecting
+                        self.cmd_tx.clone(),
+                    )
+                }),
+            _ => None,
         };
 
         if let Some((profile_name, protocol, config_path, pid, cmd_tx)) = connection_info {
@@ -1634,45 +1753,126 @@ impl App {
 
                 match output {
                     Ok(out) if out.status.success() => {
-                        let _ = cmd_tx.send(Message::Log(format!(
-                            "CMD: Successfully stopped {protocol} for '{profile_name}'"
-                        )));
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: profile_name,
+                            success: true,
+                            error: None,
+                        });
                     }
                     Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        let msg =
-                            format!("Failed to stop {protocol} for '{profile_name}': {stderr}");
-                        let _ = cmd_tx.send(crate::message::Message::Toast(
-                            format!("Error: {msg}"),
-                            ToastType::Error,
-                        ));
-                        let _ =
-                            cmd_tx.send(crate::message::Message::Log(format!("CMD_ERR: {msg}")));
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: profile_name,
+                            success: false,
+                            error: Some(format!("{protocol}: {stderr}")),
+                        });
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "Failed to execute disconnect command for '{profile_name}': {e}"
-                        );
-                        let _ = cmd_tx.send(crate::message::Message::Toast(
-                            format!("Error: {msg}"),
-                            ToastType::Error,
-                        ));
-                        let _ =
-                            cmd_tx.send(crate::message::Message::Log(format!("CMD_ERR: {msg}")));
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: profile_name,
+                            success: false,
+                            error: Some(format!("Failed to execute: {e}")),
+                        });
                     }
                 }
             });
-            // Scanner will set to Disconnected once the interface is down
         }
     }
 
-    /// Reconnect to VPN
+    /// Force-disconnect: escalates a stuck disconnect.
+    ///
+    /// For `OpenVPN`, sends SIGKILL instead of SIGTERM.
+    /// For `WireGuard`, retries `wg-quick down`.
+    fn force_disconnect(&mut self) {
+        let profile_name =
+            if let ConnectionState::Disconnecting { profile, .. } = &self.connection_state {
+                profile.clone()
+            } else {
+                return;
+            };
+
+        // Look up protocol and config from the profile
+        let force_info = self
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .map(|profile| {
+                (
+                    profile.name.clone(),
+                    profile.protocol,
+                    profile.config_path.clone(),
+                    self.cmd_tx.clone(),
+                )
+            });
+
+        if let Some((name, protocol, config_path, cmd_tx)) = force_info {
+            self.log(&format!("ACTION: Force-disconnecting '{name}'..."));
+            self.show_toast(
+                format!("Force-disconnecting '{name}'..."),
+                ToastType::Warning,
+            );
+
+            // Reset the Disconnecting timer so the 30s safety timeout starts fresh
+            self.connection_state = ConnectionState::Disconnecting {
+                started: Instant::now(),
+                profile: name.clone(),
+            };
+
+            std::thread::spawn(move || {
+                let output = match protocol {
+                    Protocol::WireGuard => {
+                        // Retry wg-quick down
+                        std::process::Command::new("wg-quick")
+                            .args(["down", config_path.to_str().unwrap_or("")])
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                    }
+                    Protocol::OpenVPN => {
+                        // Escalate to SIGKILL (kill -9) via pkill
+                        std::process::Command::new("pkill")
+                            .args(["-9", "openvpn"])
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                    }
+                };
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: name,
+                            success: true,
+                            error: None,
+                        });
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: name,
+                            success: false,
+                            error: Some(format!("Force {protocol}: {stderr}")),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = cmd_tx.send(Message::DisconnectResult {
+                            profile: name,
+                            success: false,
+                            error: Some(format!("Force-kill failed: {e}")),
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// Reconnect to VPN: queues the same profile for auto-connect after disconnect.
     fn reconnect(&mut self) {
         if let ConnectionState::Connected { profile, .. } = &self.connection_state {
             let profile_name = profile.clone();
             if let Some(idx) = self.profiles.iter().position(|p| p.name == profile_name) {
+                self.pending_connect = Some(idx);
                 self.disconnect();
-                self.connect_profile(idx);
             }
         }
     }
@@ -1999,5 +2199,675 @@ impl App {
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::scanner::ActiveSession;
+
+    /// Build a minimal `App` for unit testing (no filesystem / scanner / telemetry).
+    fn test_app() -> App {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
+        App {
+            should_quit: false,
+            connection_state: ConnectionState::Disconnected,
+            profiles: Vec::new(),
+            session_start: None,
+            down_history: vec![(0.0, 0.0)],
+            up_history: vec![(0.0, 0.0)],
+            current_down: 0,
+            current_up: 0,
+            latency_ms: 0,
+            packet_loss: 0.0,
+            jitter_ms: 0,
+            location: String::new(),
+            isp: String::new(),
+            dns_server: String::new(),
+            ipv6_leak: false,
+            public_ip: String::new(),
+            real_ip: None,
+            logs_scroll: 0,
+            logs_auto_scroll: true,
+            focused_panel: FocusedPanel::Sidebar,
+            zoomed_panel: None,
+            input_mode: InputMode::Normal,
+            show_config: false,
+            show_action_menu: false,
+            show_bulk_menu: false,
+            action_menu_state: ratatui::widgets::ListState::default(),
+            config_scroll: 0,
+            profile_list_state: TableState::default(),
+            panel_areas: HashMap::new(),
+            toast: None,
+            terminal_size: (80, 24),
+            is_root: false,
+            connection_drops: 0,
+            pending_connect: None,
+            killswitch_mode: crate::state::KillSwitchMode::Off,
+            killswitch_state: crate::state::KillSwitchState::Disabled,
+            telemetry_rx: None,
+            cmd_tx,
+            cmd_rx,
+            network_stats: telemetry::NetworkStats::default(),
+        }
+    }
+
+    /// Helper: put app into a Connected state for a given profile name.
+    fn set_connected(app: &mut App, name: &str) {
+        app.session_start = Some(Instant::now());
+        app.connection_state = ConnectionState::Connected {
+            since: Instant::now(),
+            profile: name.to_string(),
+            server_location: "Test".to_string(),
+            latency_ms: 10,
+            details: Box::new(DetailedConnectionInfo {
+                interface: "wg0".to_string(),
+                pid: Some(12345),
+                ..Default::default()
+            }),
+        };
+    }
+
+    /// Helper: put app into a Disconnecting state for a given profile name.
+    fn set_disconnecting(app: &mut App, name: &str) {
+        app.connection_state = ConnectionState::Disconnecting {
+            started: Instant::now(),
+            profile: name.to_string(),
+        };
+    }
+
+    /// Helper: create a fake `ActiveSession` for scanner results.
+    fn fake_session(name: &str) -> ActiveSession {
+        ActiveSession {
+            name: name.to_string(),
+            interface: "wg0".to_string(),
+            endpoint: "1.2.3.4:51820".to_string(),
+            internal_ip: "10.0.0.2".to_string(),
+            mtu: "1420".to_string(),
+            public_key: String::new(),
+            listen_port: "51820".to_string(),
+            transfer_rx: "100 KiB".to_string(),
+            transfer_tx: "50 KiB".to_string(),
+            latest_handshake: "5 seconds ago".to_string(),
+            pid: Some(12345),
+            started_at: None,
+        }
+    }
+
+    // ====================================================================
+    // DisconnectResult handler tests
+    // ====================================================================
+
+    #[test]
+    fn test_disconnect_result_success_transitions_to_disconnected() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "test-vpn");
+
+        app.handle_message(Message::DisconnectResult {
+            profile: "test-vpn".to_string(),
+            success: true,
+            error: None,
+        });
+
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Expected Disconnected after successful DisconnectResult"
+        );
+        assert!(app.session_start.is_none());
+        // No success toast -- header state indicator is the feedback
+    }
+
+    #[test]
+    fn test_disconnect_result_failure_shows_error_toast() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "test-vpn");
+
+        app.handle_message(Message::DisconnectResult {
+            profile: "test-vpn".to_string(),
+            success: false,
+            error: Some("permission denied".to_string()),
+        });
+
+        // Should transition out of Disconnecting
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Expected Disconnected after failed DisconnectResult"
+        );
+        // Should show error toast
+        let toast = app.toast.as_ref().expect("toast should be set");
+        assert_eq!(toast.toast_type, ToastType::Error);
+        assert!(toast.message.contains("permission denied"));
+    }
+
+    #[test]
+    fn test_disconnect_result_success_from_non_disconnecting_state() {
+        let mut app = test_app();
+        // Already Disconnected -- result arrives late
+        app.connection_state = ConnectionState::Disconnected;
+
+        app.handle_message(Message::DisconnectResult {
+            profile: "test-vpn".to_string(),
+            success: true,
+            error: None,
+        });
+
+        // Should still be Disconnected, no panic
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnected
+        ));
+    }
+
+    // ====================================================================
+    // Scanner debounce guard tests (SyncSystemState while Disconnecting)
+    // ====================================================================
+
+    #[test]
+    fn test_scanner_never_overrides_disconnecting_to_connected() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "test-vpn");
+
+        // Scanner sees interface still up
+        let sessions = vec![fake_session("test-vpn")];
+        app.handle_message(Message::SyncSystemState(sessions));
+
+        // Must still be Disconnecting -- NOT Connected
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnecting { .. }),
+            "Scanner must never override Disconnecting to Connected, got {:?}",
+            app.connection_state
+        );
+    }
+
+    #[test]
+    fn test_scanner_confirms_disconnect_when_interface_gone() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "test-vpn");
+
+        // Scanner sees no active sessions
+        app.handle_message(Message::SyncSystemState(vec![]));
+
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Scanner should confirm Disconnected when interface is gone"
+        );
+        assert!(app.session_start.is_none());
+    }
+
+    #[test]
+    fn test_scanner_safety_timeout_after_30s() {
+        let mut app = test_app();
+        // Set disconnecting with a start time 31 seconds in the past
+        app.connection_state = ConnectionState::Disconnecting {
+            started: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(31))
+                .unwrap(),
+            profile: "test-vpn".to_string(),
+        };
+
+        // Scanner sees interface still up
+        let sessions = vec![fake_session("test-vpn")];
+        app.handle_message(Message::SyncSystemState(sessions));
+
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Should time out to Disconnected after 30s"
+        );
+        // Should show warning toast
+        let toast = app.toast.as_ref().expect("timeout should show toast");
+        assert_eq!(toast.toast_type, ToastType::Warning);
+        assert!(toast.message.contains("timed out"));
+    }
+
+    #[test]
+    fn test_scanner_disconnecting_does_not_affect_other_profiles() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "vpn-a");
+
+        // Scanner sees a different profile active (shouldn't affect our Disconnecting guard)
+        let sessions = vec![fake_session("vpn-b")];
+        app.handle_message(Message::SyncSystemState(sessions));
+
+        // Interface for "vpn-a" is gone (vpn-b is someone else), so confirm disconnect
+        // Actually, the guard checks `!active.iter().any(|s| &s.name == profile)`.
+        // "vpn-a" is not in the list -> interface_gone = true -> Disconnected
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Should detect our profile is gone even if other profiles are active"
+        );
+    }
+
+    // ====================================================================
+    // Force disconnect (d pressed twice) tests
+    // ====================================================================
+
+    #[test]
+    fn test_d_while_disconnecting_escalates_to_force() {
+        let mut app = test_app();
+        set_disconnecting(&mut app, "test-vpn");
+        add_profiles(&mut app, &["test-vpn"]);
+
+        let before = if let ConnectionState::Disconnecting { started, .. } = &app.connection_state {
+            *started
+        } else {
+            panic!("expected Disconnecting");
+        };
+
+        // 'd' while Disconnecting => force disconnect (resets the timer)
+        app.handle_message(Message::Disconnect);
+
+        // Should still be Disconnecting (the force thread was spawned)
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ));
+
+        // Timer should have been reset (new started >= old started)
+        if let ConnectionState::Disconnecting { started, .. } = &app.connection_state {
+            assert!(*started >= before);
+        }
+
+        // Should show a warning toast about force disconnect
+        let toast = app.toast.as_ref().expect("force disconnect shows toast");
+        assert_eq!(toast.toast_type, ToastType::Warning);
+        assert!(toast.message.contains("Force"));
+    }
+
+    #[test]
+    fn test_d_while_disconnected_is_noop() {
+        let mut app = test_app();
+        app.handle_message(Message::Disconnect);
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnected
+        ));
+    }
+
+    // ====================================================================
+    // Helpers for new tests
+    // ====================================================================
+
+    /// Helper: put app into a Connecting state for a given profile name.
+    fn set_connecting(app: &mut App, name: &str) {
+        app.connection_state = ConnectionState::Connecting {
+            started: Instant::now(),
+            profile: name.to_string(),
+        };
+    }
+
+    /// Helper: add test profiles to the app.
+    fn add_profiles(app: &mut App, names: &[&str]) {
+        for name in names {
+            app.profiles.push(VpnProfile {
+                name: (*name).to_string(),
+                protocol: Protocol::WireGuard,
+                config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
+                location: "Test".to_string(),
+                last_used: None,
+            });
+        }
+    }
+
+    // ====================================================================
+    // Pending connect / VPN switching tests
+    // ====================================================================
+
+    #[test]
+    fn test_toggle_connected_different_profile_sets_pending() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_connected(&mut app, "vpn-a");
+
+        // Toggle to profile index 1 ("vpn-b") while connected to "vpn-a"
+        app.toggle_connection(1);
+
+        // Should set pending_connect to index 1
+        assert_eq!(app.pending_connect, Some(1));
+        // State should be Disconnecting (disconnect was called for vpn-a)
+        // Note: disconnect() requires root / matching profile, so state change
+        // depends on whether the profile was found. Since we added profiles, it should work.
+        // But since is_root is false in test, connect_profile won't actually run.
+        // disconnect() transitions to Disconnecting if it finds the profile.
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnecting { .. }),
+            "Expected Disconnecting after switch request, got {:?}",
+            app.connection_state
+        );
+    }
+
+    #[test]
+    fn test_toggle_connected_same_profile_disconnects_without_pending() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a"]);
+        set_connected(&mut app, "vpn-a");
+
+        // Toggle same profile => just disconnect
+        app.toggle_connection(0);
+
+        assert_eq!(
+            app.pending_connect, None,
+            "Same-profile toggle should not set pending"
+        );
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ));
+    }
+
+    #[test]
+    fn test_toggle_while_disconnecting_queues_pending() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_disconnecting(&mut app, "vpn-a");
+
+        // Press '2' (toggle profile index 1) while disconnecting
+        app.toggle_connection(1);
+
+        assert_eq!(app.pending_connect, Some(1));
+        // Should still be in Disconnecting state (not overridden)
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ));
+        // No toast -- header state indicator is the feedback
+    }
+
+    #[test]
+    fn test_toggle_while_connecting_is_rejected() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_connecting(&mut app, "vpn-a");
+
+        app.toggle_connection(1);
+
+        // Should be rejected (still Connecting)
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Connecting { .. }
+        ));
+        assert_eq!(app.pending_connect, None);
+        // No toast -- header state indicator shows "Connecting..."
+    }
+
+    #[test]
+    fn test_pending_connect_drained_on_disconnect_success() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_disconnecting(&mut app, "vpn-a");
+        app.pending_connect = Some(1);
+        app.is_root = true; // so connect_profile can run
+
+        // Simulate successful disconnect result
+        app.handle_message(Message::DisconnectResult {
+            profile: "vpn-a".to_string(),
+            success: true,
+            error: None,
+        });
+
+        // pending_connect should have been drained
+        assert_eq!(app.pending_connect, None);
+        // State should now be Connecting (auto-connected to vpn-b)
+        assert!(
+            matches!(app.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+            "Expected Connecting to vpn-b, got {:?}",
+            app.connection_state
+        );
+    }
+
+    #[test]
+    fn test_pending_connect_drained_on_scanner_interface_gone() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_disconnecting(&mut app, "vpn-a");
+        app.pending_connect = Some(1);
+        app.is_root = true;
+
+        // Scanner sees no active sessions (interface gone)
+        app.handle_message(Message::SyncSystemState(vec![]));
+
+        assert_eq!(app.pending_connect, None);
+        assert!(
+            matches!(app.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+            "Expected auto-connect to vpn-b after scanner confirms disconnect"
+        );
+    }
+
+    #[test]
+    fn test_pending_cleared_on_disconnect_failure() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        set_disconnecting(&mut app, "vpn-a");
+        app.pending_connect = Some(1);
+
+        // Simulate failed disconnect
+        app.handle_message(Message::DisconnectResult {
+            profile: "vpn-a".to_string(),
+            success: false,
+            error: Some("permission denied".to_string()),
+        });
+
+        // Pending should be cleared (don't auto-connect after failure)
+        assert_eq!(app.pending_connect, None);
+        // State should be Disconnected (scanner will re-detect if VPN is still up)
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnected
+        ));
+    }
+
+    #[test]
+    fn test_pending_cleared_on_30s_timeout() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+        app.connection_state = ConnectionState::Disconnecting {
+            started: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(31))
+                .unwrap(),
+            profile: "vpn-a".to_string(),
+        };
+        app.pending_connect = Some(1);
+
+        // Scanner sees interface still up -> 30s timeout triggers
+        let sessions = vec![fake_session("vpn-a")];
+        app.handle_message(Message::SyncSystemState(sessions));
+
+        // Pending should be cleared on timeout (VPN may still be running)
+        assert_eq!(app.pending_connect, None);
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnected
+        ));
+    }
+
+    // ====================================================================
+    // ConnectResult tests
+    // ====================================================================
+
+    #[test]
+    fn test_connect_result_success_keeps_connecting() {
+        let mut app = test_app();
+        set_connecting(&mut app, "test-vpn");
+
+        app.handle_message(Message::ConnectResult {
+            profile: "test-vpn".to_string(),
+            success: true,
+            error: None,
+        });
+
+        // Should still be Connecting -- scanner will promote to Connected
+        assert!(
+            matches!(app.connection_state, ConnectionState::Connecting { .. }),
+            "Successful ConnectResult should keep Connecting state"
+        );
+    }
+
+    #[test]
+    fn test_connect_result_failure_transitions_to_disconnected() {
+        let mut app = test_app();
+        set_connecting(&mut app, "test-vpn");
+
+        app.handle_message(Message::ConnectResult {
+            profile: "test-vpn".to_string(),
+            success: false,
+            error: Some("wg-quick: already exists".to_string()),
+        });
+
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnected),
+            "Failed ConnectResult should transition to Disconnected"
+        );
+        let toast = app.toast.as_ref().expect("should show error toast");
+        assert_eq!(toast.toast_type, ToastType::Error);
+        assert!(toast.message.contains("Failed to connect"));
+    }
+
+    #[test]
+    fn test_connect_result_failure_clears_pending() {
+        let mut app = test_app();
+        set_connecting(&mut app, "test-vpn");
+        app.pending_connect = Some(1);
+
+        app.handle_message(Message::ConnectResult {
+            profile: "test-vpn".to_string(),
+            success: false,
+            error: Some("error".to_string()),
+        });
+
+        assert_eq!(
+            app.pending_connect, None,
+            "Connect failure should clear pending"
+        );
+    }
+
+    // ====================================================================
+    // Disconnect from Connecting state tests
+    // ====================================================================
+
+    #[test]
+    fn test_disconnect_from_connecting_state() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["test-vpn"]);
+        set_connecting(&mut app, "test-vpn");
+
+        app.disconnect();
+
+        // Should transition to Disconnecting
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnecting { .. }),
+            "disconnect() should work from Connecting state, got {:?}",
+            app.connection_state
+        );
+    }
+
+    #[test]
+    fn test_d_key_from_connecting_state_disconnects() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["test-vpn"]);
+        set_connecting(&mut app, "test-vpn");
+
+        app.handle_message(Message::Disconnect);
+
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnecting { .. }),
+            "d key should cancel Connecting state"
+        );
+    }
+
+    // ====================================================================
+    // Reconnect uses pending_connect (no race)
+    // ====================================================================
+
+    #[test]
+    fn test_reconnect_sets_pending_not_immediate_connect() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["test-vpn"]);
+        set_connected(&mut app, "test-vpn");
+
+        app.reconnect();
+
+        // Should set pending_connect and disconnect (not immediately reconnect)
+        assert_eq!(app.pending_connect, Some(0));
+        assert!(
+            matches!(app.connection_state, ConnectionState::Disconnecting { .. }),
+            "Reconnect should disconnect first"
+        );
+    }
+
+    #[test]
+    fn test_reconnect_auto_connects_after_disconnect_completes() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["test-vpn"]);
+        set_disconnecting(&mut app, "test-vpn");
+        app.pending_connect = Some(0);
+        app.is_root = true;
+
+        // Disconnect completes
+        app.handle_message(Message::DisconnectResult {
+            profile: "test-vpn".to_string(),
+            success: true,
+            error: None,
+        });
+
+        // Should auto-connect to index 0
+        assert_eq!(app.pending_connect, None);
+        assert!(
+            matches!(app.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "test-vpn"),
+            "Reconnect should auto-connect after disconnect"
+        );
+    }
+
+    // ====================================================================
+    // QuickConnect (1-9) edge cases
+    // ====================================================================
+
+    #[test]
+    fn test_quick_connect_while_connected_switches_vpn() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b", "vpn-c"]);
+        set_connected(&mut app, "vpn-a");
+
+        // Press '2' to switch to vpn-b
+        app.handle_message(Message::QuickConnect(1));
+
+        assert_eq!(app.pending_connect, Some(1));
+        assert!(matches!(
+            app.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ));
+    }
+
+    #[test]
+    fn test_quick_connect_while_disconnecting_updates_pending() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a", "vpn-b", "vpn-c"]);
+        set_disconnecting(&mut app, "vpn-a");
+        app.pending_connect = Some(1); // originally queued vpn-b
+
+        // User changes mind, presses '3' for vpn-c
+        app.handle_message(Message::QuickConnect(2));
+
+        assert_eq!(
+            app.pending_connect,
+            Some(2),
+            "Should update pending to new choice"
+        );
+    }
+
+    #[test]
+    fn test_quick_connect_from_disconnected() {
+        let mut app = test_app();
+        add_profiles(&mut app, &["vpn-a"]);
+        app.is_root = true;
+
+        app.handle_message(Message::QuickConnect(0));
+
+        // Should go directly to Connecting (no pending)
+        assert!(
+            matches!(app.connection_state, ConnectionState::Connecting { .. }),
+            "QuickConnect from Disconnected should go to Connecting"
+        );
+        assert_eq!(app.pending_connect, None);
     }
 }

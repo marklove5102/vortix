@@ -115,6 +115,9 @@ pub const KILLSWITCH_EMERGENCY_MSG: &str =
 
 // === Import & Download Configuration ===
 
+/// Maximum config file size (1 MB). Anything larger is almost certainly not a VPN config.
+pub const MAX_CONFIG_SIZE_BYTES: u64 = 1_024 * 1_024;
+
 /// Default filename for downloaded profiles if none can be determined.
 pub const DEFAULT_IMPORTED_FILENAME: &str = "imported_profile.conf";
 
