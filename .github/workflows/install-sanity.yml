@@ -48,6 +48,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Run shell installer
         run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
 
@@ -56,8 +58,10 @@ jobs:
 
       - name: Get expected version from latest release
         id: expected
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(curl -s https://api.github.com/repos/Harry-kp/vortix/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))")
+          VERSION=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName' | sed 's/^v//')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify --version
@@ -73,10 +77,14 @@ jobs:
     name: Static binary (Linux musl)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Get latest release tag
         id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG=$(curl -s https://api.github.com/repos/Harry-kp/vortix/releases/latest | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          TAG=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName')
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
