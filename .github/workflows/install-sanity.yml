@@ -40,6 +40,28 @@ jobs:
       - name: Verify --help
         run: vortix --help
 
+      - name: "Verify sudo access (Linux: expect failure before symlink)"
+        if: runner.os == 'Linux'
+        run: |
+          if sudo vortix --version 2>/dev/null; then
+            echo "ERROR: sudo vortix should NOT work without symlink on Linux"
+            exit 1
+          fi
+          echo "Confirmed: sudo vortix fails without symlink (expected)"
+
+      - name: "Verify sudo access (Linux: create symlink and retry)"
+        if: runner.os == 'Linux'
+        run: |
+          sudo ln -s "$HOME/.cargo/bin/vortix" /usr/local/bin/vortix
+          OUTPUT=$(sudo vortix --version)
+          echo "After symlink: $OUTPUT"
+
+      - name: Verify sudo access (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OUTPUT=$(sudo vortix --version)
+          echo "sudo vortix works on macOS: $OUTPUT"
+
   shell-installer:
     name: Shell installer (${{ matrix.os }})
     strategy:
@@ -70,8 +92,30 @@ jobs:
           echo "Got: $OUTPUT"
           echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
 
-      - name: Verify --help
+      - name: Verify --help (shell-installer)
         run: vortix --help
+
+      - name: "Verify sudo access (Linux: expect failure before symlink)"
+        if: runner.os == 'Linux'
+        run: |
+          if sudo vortix --version 2>/dev/null; then
+            echo "ERROR: sudo vortix should NOT work without symlink on Linux"
+            exit 1
+          fi
+          echo "Confirmed: sudo vortix fails without symlink (expected)"
+
+      - name: "Verify sudo access (Linux: create symlink and retry)"
+        if: runner.os == 'Linux'
+        run: |
+          sudo ln -s "$HOME/.cargo/bin/vortix" /usr/local/bin/vortix
+          OUTPUT=$(sudo vortix --version)
+          echo "After symlink: $OUTPUT"
+
+      - name: Verify sudo access (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OUTPUT=$(sudo vortix --version)
+          echo "sudo vortix works on macOS: $OUTPUT"
 
   static-binary:
     name: Static binary (Linux musl)
@@ -104,6 +148,12 @@ jobs:
       - name: Verify --help
         run: ./vortix-x86_64-unknown-linux-musl/vortix --help
 
+      - name: Verify sudo access (copy to /usr/local/bin)
+        run: |
+          sudo cp vortix-x86_64-unknown-linux-musl/vortix /usr/local/bin/vortix
+          OUTPUT=$(sudo vortix --version)
+          echo "sudo vortix works: $OUTPUT"
+
   arch-linux:
     name: Arch Linux (pacman)
     runs-on: ubuntu-latest
@@ -123,3 +173,9 @@ jobs:
 
       - name: Verify --help
         run: vortix --help
+
+      - name: Verify binary is in system PATH (/usr/bin)
+        run: |
+          LOCATION=$(which vortix)
+          echo "Installed at: $LOCATION"
+          echo "$LOCATION" | grep -q "/usr/bin/vortix"
