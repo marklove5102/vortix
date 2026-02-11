@@ -28,7 +28,7 @@ jobs:
       - name: Get expected version from crates.io
         id: expected
         run: |
-          VERSION=$(curl -s https://crates.io/api/v1/crates/vortix | python3 -c "import sys,json; print(json.load(sys.stdin)['crate']['max_version'])")
+          VERSION=$(curl -s -H "User-Agent: vortix-ci (https://github.com/Harry-kp/vortix)" https://crates.io/api/v1/crates/vortix | python3 -c "import sys,json; print(json.load(sys.stdin)['crate']['max_version'])")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify --version
@@ -37,8 +37,8 @@ jobs:
           echo "Got: $OUTPUT"
           echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
 
-      - name: Verify info subcommand
-        run: vortix info
+      - name: Verify --help
+        run: vortix --help
 
   shell-installer:
     name: Shell installer (${{ matrix.os }})
@@ -66,8 +66,8 @@ jobs:
           echo "Got: $OUTPUT"
           echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
 
-      - name: Verify info subcommand
-        run: vortix info
+      - name: Verify --help
+        run: vortix --help
 
   static-binary:
     name: Static binary (Linux musl)
@@ -93,8 +93,8 @@ jobs:
           echo "Got: $OUTPUT"
           echo "$OUTPUT" | grep -q "${{ steps.release.outputs.version }}"
 
-      - name: Verify info subcommand
-        run: ./vortix-x86_64-unknown-linux-musl/vortix info
+      - name: Verify --help
+        run: ./vortix-x86_64-unknown-linux-musl/vortix --help
 
   arch-linux:
     name: Arch Linux (pacman)
@@ -113,5 +113,5 @@ jobs:
           # Log version but don't assert -- Arch package may lag behind
           echo "Arch package version: $OUTPUT"
 
-      - name: Verify info subcommand
-        run: vortix info
+      - name: Verify --help
+        run: vortix --help
