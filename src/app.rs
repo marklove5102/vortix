@@ -1987,7 +1987,7 @@ impl App {
 
         for tool in &missing {
             self.log(&format!(
-                "WARN: '{}' not found — run: {}",
+                "WARN: '{}' not found - run: {}",
                 tool,
                 crate::platform::install_hint(tool)
             ));

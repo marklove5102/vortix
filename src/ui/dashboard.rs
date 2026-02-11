@@ -1380,10 +1380,15 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
             // Build the message portion
             let message = &entry.message;
 
-            // Truncate to fit available width after the structured prefix
+            // Truncate to fit available width after the structured prefix.
+            // Use char boundaries to avoid panicking on multi-byte UTF-8.
             let max_msg_len = (inner.width as usize).saturating_sub(constants::LOG_PREFIX_WIDTH);
             let truncated_msg = if message.len() > max_msg_len {
-                format!("{}…", &message[..max_msg_len.saturating_sub(1)])
+                let mut end = max_msg_len.saturating_sub(1);
+                while end > 0 && !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &message[..end])
             } else {
                 message.clone()
             };

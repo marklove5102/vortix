@@ -209,8 +209,11 @@ fn mask_sensitive_value(key: &str, value: &str) -> String {
     let key_lower = key.to_lowercase();
     if sensitive_keys.iter().any(|k| key_lower.contains(k)) {
         // Show first 4 and last 4 chars, mask the rest
-        if value.len() > 12 {
-            format!("{}...{} (masked)", &value[..4], &value[value.len() - 4..])
+        let chars: Vec<char> = value.chars().collect();
+        if chars.len() > 12 {
+            let head: String = chars[..4].iter().collect();
+            let tail: String = chars[chars.len() - 4..].iter().collect();
+            format!("{head}...{tail} (masked)")
         } else {
             "••••••••••••".to_string()
         }
