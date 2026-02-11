@@ -47,21 +47,24 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 
 ## Requirements
 
-### macOS
+### Runtime dependencies
 
-- macOS 12+ (uses `ifconfig`, `netstat`, `wg`, `ps`, `pfctl`)
-- Rust 1.75+ (for building from source)
-- `curl` (for telemetry and IP detection; pre-installed on macOS)
-- WireGuard: `brew install wireguard-tools`
-- OpenVPN: `brew install openvpn`
+| Dependency | macOS | Linux | Purpose |
+|------------|-------|-------|---------|
+| `curl` | Pre-installed | `apt install curl` | Telemetry and IP detection |
+| `openvpn` | `brew install openvpn` | `apt install openvpn` | OpenVPN sessions |
+| `wireguard-tools` | `brew install wireguard-tools` | `apt install wireguard-tools` | WireGuard sessions |
+| `iptables` or `nftables` | N/A (uses `pfctl`) | Pre-installed | Kill switch |
+| `iproute2` | N/A (uses `ifconfig`) | Pre-installed | Interface detection |
 
-### Linux
+> Vortix checks for missing tools at startup and shows a warning toast with install instructions.
 
-- Linux kernel 3.10+ (kernel 5.6+ recommended for native WireGuard; older kernels require `wireguard-tools`)
-- `curl` (for telemetry and IP detection; **not pre-installed on minimal Ubuntu/Debian**)
-- `iproute2` (for `ip addr` interface detection; pre-installed on most distros)
-- `iptables` or `nftables` (for kill switch; prefers iptables when both are available)
-- Rust 1.75+ (for building from source)
+### Build dependencies (source installs only)
+
+- Rust 1.75+
+- macOS 12+ or Linux kernel 3.10+ (5.6+ recommended for native WireGuard)
+
+### Quick install commands
 
 **Ubuntu/Debian:**
 ```bash
@@ -73,7 +76,7 @@ sudo apt install curl wireguard-tools openvpn iptables iproute2
 sudo dnf install curl wireguard-tools openvpn iptables iproute
 ```
 
-**Arch Linux:**
+**Arch Linux** (only needed for source builds — `pacman -S vortix` handles deps automatically):
 ```bash
 sudo pacman -S curl wireguard-tools openvpn iptables iproute2
 ```
@@ -99,9 +102,9 @@ pacman -S vortix
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
 ```
 
-**Static binary (Linux - works on any distro):**
+**Static binary (Linux):**
 
-Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a fully static binary with no runtime dependencies.
+Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (curl, openvpn/wireguard-tools, etc.).
 
 **From source:**
 ```bash
@@ -110,7 +113,14 @@ cd vortix
 cargo install --path .
 ```
 
-Profiles are stored in `~/.config/vortix/profiles/` with `chmod 600`.
+## Usage
+
+```bash
+sudo vortix              # Launch TUI (requires root for VPN operations)
+vortix import <file>     # Import a .conf or .ovpn profile
+vortix info              # Show config directory and version
+vortix update            # Self-update to latest release
+```
 
 ### Keybindings
 
@@ -130,30 +140,6 @@ Profiles are stored in `~/.config/vortix/profiles/` with `chmod 600`.
 | `b` | Open Bulk Menu |
 | `Del` | Delete Profile (Sidebar) |
 | `q` | Quit Application |
-
-## How It Works
-
-**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `netstat -ib`, Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
-
-**Security (Kill Switch & Leak Detection):**
-- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Automatically blocks all non-VPN traffic when connection drops.
-- **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
-- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `scutil --dns` / `networksetup`, Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
-
-**WireGuard Integration:** macOS resolves interface names via `/var/run/wireguard/*.name`. Linux uses kernel WireGuard interfaces directly (`wg0`, `wg1`, etc.). Both platforms parse `wg show` for handshake timing, transfer stats, and endpoint metadata.
-
-**OpenVPN Integration:** Tracks session uptime and connection status via `ps` proc parsing. Interface detection uses `ifconfig` on macOS and `ip addr` on Linux.
-
-### Platform Notes
-
-| Feature | macOS | Linux |
-|---------|-------|-------|
-| Kill switch | `pfctl` (PF) | `iptables` or `nftables` |
-| Network stats | `netstat -ib` | `/proc/net/dev` |
-| Interface detection | `ifconfig` + `/var/run/wireguard/` | `ip addr` + `wg show` |
-| DNS detection | `scutil --dns`, `networksetup` | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
-| Default VPN iface | `utun0` | `wg0` |
-| Tested distros | macOS 12+ | Ubuntu, Fedora, Arch |
 
 ## Configuration
 
@@ -264,6 +250,30 @@ ip_api_primary = "https://ipinfo.io/json"
 ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
 ```
 
+## How It Works
+
+**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `netstat -ib`, Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
+
+**Security (Kill Switch & Leak Detection):**
+- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Automatically blocks all non-VPN traffic when connection drops.
+- **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
+- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `scutil --dns` / `networksetup`, Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
+
+**WireGuard Integration:** macOS resolves interface names via `/var/run/wireguard/*.name`. Linux uses kernel WireGuard interfaces directly (`wg0`, `wg1`, etc.). Both platforms parse `wg show` for handshake timing, transfer stats, and endpoint metadata.
+
+**OpenVPN Integration:** Tracks session uptime and connection status via `ps` proc parsing. Interface detection uses `ifconfig` on macOS and `ip addr` on Linux.
+
+### Platform Notes
+
+| Feature | macOS | Linux |
+|---------|-------|-------|
+| Kill switch | `pfctl` (PF) | `iptables` or `nftables` |
+| Network stats | `netstat -ib` | `/proc/net/dev` |
+| Interface detection | `ifconfig` + `/var/run/wireguard/` | `ip addr` + `wg show` |
+| DNS detection | `scutil --dns`, `networksetup` | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
+| Default VPN iface | `utun0` | `wg0` |
+| Tested distros | macOS 12+ | Ubuntu, Fedora, Arch |
+
 ## Troubleshooting
 
 **Profiles missing after upgrade (Linux)**
@@ -295,14 +305,6 @@ sudo ln -s ~/.cargo/bin/vortix /usr/local/bin/vortix
 Or run with the full path: `sudo ~/.cargo/bin/vortix`
 
 This doesn't affect macOS (which preserves user PATH under sudo) or Arch Linux (`pacman` installs to `/usr/bin/`).
-
-**Custom config directory**
-
-Use `--config-dir` to point vortix to any directory:
-
-```bash
-sudo vortix --config-dir ~/my-vpn-config
-```
 
 ## Development
 
