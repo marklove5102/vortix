@@ -176,6 +176,6 @@ jobs:
 
       - name: Verify binary is in system PATH (/usr/bin)
         run: |
-          LOCATION=$(which vortix)
+          LOCATION=$(command -v vortix)
           echo "Installed at: $LOCATION"
           echo "$LOCATION" | grep -q "/usr/bin/vortix"
