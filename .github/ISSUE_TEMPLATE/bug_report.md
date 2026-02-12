@@ -1,32 +1,61 @@
 ---
 name: Bug Report
-about: Report a bug to help us improve
-title: '[Bug] '
+about: Report a bug to help us improve Vortix
+title: "[Bug] "
 labels: bug
-assignees: ''
+assignees: ""
 ---
 
-## Describe the Bug
-A clear description of what the bug is.
+## Bug Description
+<!-- What happened? What did you expect instead? -->
 
-## To Reproduce
-Steps to reproduce:
+
+## Steps to Reproduce
+<!--
 1. Run `sudo vortix`
-2. Do '...'
+2. Select profile '...'
 3. See error
+-->
 
-## Expected Behavior
-What you expected to happen.
+1.
+2.
+3.
 
 ## Environment
-- **OS:** macOS [version]
-- **Vortix version:** [e.g., 0.2.0]
-- **VPN type:** WireGuard / OpenVPN
-- **Install method:** cargo install / binary / source
-
-## Logs / Screenshots
-If applicable, add logs or screenshots.
+<!--
+Tip: Run `vortix report` to auto-generate this entire section.
+Or fill in manually:
+-->
 
 ```
-Paste any error messages here
+Vortix:       [version] ([install method])
+OS:           [os] ([arch])
+Terminal:     [TERM] ([cols x rows])
+Shell:        [shell]
+Running as:   [user / root]
 ```
+
+## Dependencies
+<!--
+Tip: Run `vortix report` to auto-detect these.
+Or list the relevant tools:
+-->
+
+```
+curl         [path] ([version])
+wg-quick     [path]
+wg           [path] ([version])
+openvpn      [path] ([version])
+```
+
+## Config
+
+```
+Directory:   [config dir] ([source])
+config.toml: [found / not found]
+Profiles:    [count] ([wg] WireGuard, [ovpn] OpenVPN)
+Kill switch: [state]
+```
+
+## Additional Context
+<!-- Screenshots, error messages, log snippets (please redact any IPs or server endpoints) -->

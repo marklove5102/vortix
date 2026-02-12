@@ -37,4 +37,6 @@ pub enum Commands {
     Update,
     /// Emergency release of kill switch (use if locked out)
     ReleaseKillSwitch,
+    /// Generate a pre-filled bug report with system diagnostics
+    Report,
 }

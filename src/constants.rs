@@ -262,6 +262,13 @@ pub const CLI_MSG_UPDATE_CMD: &str = "   cargo install vortix --force";
 pub const CLI_MSG_UPDATE_FAIL_CARGO: &str = "Failed to run cargo: ";
 pub const CLI_MSG_UPDATE_PATH_HINT: &str = "   Make sure cargo is installed and in your PATH.";
 
+// === Bug Report ===
+
+/// GitHub repository URL for constructing issue links.
+pub const GITHUB_REPO_URL: &str = "https://github.com/Harry-kp/vortix";
+/// Maximum character length for a GitHub issue URL (GitHub truncates beyond this).
+pub const GITHUB_ISSUE_URL_LIMIT: usize = 8100;
+
 // === Error Messages ===
 
 pub const ERR_HTML_CONTENT: &str =

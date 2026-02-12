@@ -27,6 +27,10 @@ pub fn handle_command(command: &Commands, config_dir: &Path, config_source: &str
             handle_release_killswitch();
             Ok(true)
         }
+        Commands::Report => {
+            super::report::run(config_dir, config_source);
+            Ok(true)
+        }
     }
 }
 
