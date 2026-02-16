@@ -264,8 +264,8 @@ pub const CLI_MSG_UPDATE_PATH_HINT: &str = "   Make sure cargo is installed and 
 
 // === Bug Report ===
 
-/// GitHub repository URL for constructing issue links.
-pub const GITHUB_REPO_URL: &str = "https://github.com/Harry-kp/vortix";
+/// GitHub repository URL for constructing issue links (from Cargo.toml `repository`).
+pub const GITHUB_REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
 /// Maximum character length for a GitHub issue URL (GitHub truncates beyond this).
 pub const GITHUB_ISSUE_URL_LIMIT: usize = 8100;
 

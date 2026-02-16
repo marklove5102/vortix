@@ -8,7 +8,7 @@
 //! server endpoints, profile names, credentials, DNS servers, or log contents.
 
 use std::fmt::Write as _;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -139,7 +139,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     };
 
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let profile_counts = count_profiles(&profiles_dir);
+    let profile_counts = super::commands::count_profiles(&profiles_dir);
 
     let ks_state = match crate::core::killswitch::load_state() {
         Some(state) => format!("{:?} ({:?})", state.mode, state.state),
@@ -163,35 +163,12 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string()),
         is_root: crate::utils::is_root(),
         tools: collect_tool_statuses(),
-        config_dir: config_dir.display().to_string(),
+        config_dir: redact_home_prefix(&config_dir.display().to_string()),
         config_source: config_source.to_string(),
         config_toml_status,
         profile_counts,
         killswitch_state: ks_state,
     }
-}
-
-/// Count VPN profiles by extension. Duplicated from `commands.rs` to avoid
-/// making that function public (it's an implementation detail of `info`).
-fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
-    if !profiles_dir.is_dir() {
-        return (0, 0);
-    }
-    let mut wg = 0u32;
-    let mut ovpn = 0u32;
-    if let Ok(entries) = std::fs::read_dir(profiles_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("conf") => wg += 1,
-                    Some("ovpn") => ovpn += 1,
-                    _ => {}
-                }
-            }
-        }
-    }
-    (wg, ovpn)
 }
 
 // ── Install method detection ────────────────────────────────────────────────
@@ -202,18 +179,23 @@ fn detect_install_method() -> String {
         Err(_) => return "unknown".to_string(),
     };
 
+    install_method_from_path(&exe).to_string()
+}
+
+/// Determine install method from an executable path string.
+fn install_method_from_path(exe: &str) -> &'static str {
     if exe.contains("/.cargo/bin/") {
-        "cargo install".to_string()
+        "cargo install"
     } else if exe.contains("/opt/homebrew/") || exe.contains("/usr/local/Cellar/") {
-        "homebrew".to_string()
+        "homebrew"
     } else if exe.contains("/nix/store/") {
-        "nix".to_string()
+        "nix"
     } else if exe.contains("/usr/bin/") || exe.contains("/usr/local/bin/") {
-        "system package".to_string()
+        "system package"
     } else if exe.contains("/target/debug/") || exe.contains("/target/release/") {
-        "built from source".to_string()
+        "built from source"
     } else {
-        "binary".to_string()
+        "binary"
     }
 }
 
@@ -391,15 +373,20 @@ fn read_user_description() -> String {
     let stdin = io::stdin();
     let mut lines = Vec::new();
 
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(l) if l.is_empty() => break,
-            Ok(l) => {
-                print!("  ");
-                let _ = io::stdout().flush();
-                lines.push(l);
+    loop {
+        print!("  ");
+        let _ = io::stdout().flush();
+
+        let mut buf = String::new();
+        match stdin.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = buf.trim_end_matches(&['\r', '\n'][..]).to_string();
+                if line.is_empty() {
+                    break;
+                }
+                lines.push(line);
             }
-            Err(_) => break,
         }
     }
 
@@ -506,37 +493,58 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
 // ── GitHub URL construction ─────────────────────────────────────────────────
 
 fn build_github_url(body: &str) -> String {
-    let encoded_body = urlencoding::encode(body);
-    let url = format!(
-        "{}/issues/new?labels=bug&title={}&body={encoded_body}",
+    let encoded_title = urlencoding::encode("[Bug] ");
+    let base_prefix = format!(
+        "{}/issues/new?labels=bug&title={}&body=",
         constants::GITHUB_REPO_URL,
-        urlencoding::encode("[Bug] "),
+        encoded_title,
     );
 
+    let encoded_body = urlencoding::encode(body);
+    let full_url = format!("{base_prefix}{encoded_body}");
+
     // GitHub silently truncates URLs beyond ~8100 chars
-    if url.len() > constants::GITHUB_ISSUE_URL_LIMIT {
-        // Rebuild with a truncation note
-        let suffix = "\n\n<!-- Report truncated due to URL length limit. Please add remaining details manually. -->";
-        let max_body_len = constants::GITHUB_ISSUE_URL_LIMIT
-            .saturating_sub(200) // room for the base URL + params
-            .saturating_sub(suffix.len());
-
-        // Truncate the raw body, then re-encode
-        let truncated: String = body.chars().take(max_body_len).collect();
-        let truncated_body = format!("{truncated}{suffix}");
-        let encoded = urlencoding::encode(&truncated_body);
-
-        format!(
-            "{}/issues/new?labels=bug&title={}&body={encoded}",
-            constants::GITHUB_REPO_URL,
-            urlencoding::encode("[Bug] "),
-        )
-        .chars()
-        .take(constants::GITHUB_ISSUE_URL_LIMIT)
-        .collect()
-    } else {
-        url
+    if full_url.len() <= constants::GITHUB_ISSUE_URL_LIMIT {
+        return full_url;
     }
+
+    // Truncate the *raw* body (never the encoded URL) to avoid splitting
+    // percent-encoding sequences like %0A. Binary search for the longest
+    // prefix that fits within the limit when encoded.
+    let suffix = "\n\n<!-- Report truncated due to URL length limit. Please add remaining details manually. -->";
+    let max_body_encoded_len = constants::GITHUB_ISSUE_URL_LIMIT.saturating_sub(base_prefix.len());
+
+    if max_body_encoded_len == 0 {
+        return base_prefix;
+    }
+
+    let body_chars: Vec<char> = body.chars().collect();
+    let mut low = 0usize;
+    let mut high = body_chars.len();
+    let mut best_url = base_prefix.clone();
+
+    while low <= high {
+        let mid = (low + high) / 2;
+
+        let candidate_raw: String = body_chars.iter().take(mid).collect();
+        let candidate_with_suffix = format!("{candidate_raw}{suffix}");
+        let encoded_candidate = urlencoding::encode(&candidate_with_suffix);
+
+        if encoded_candidate.len() <= max_body_encoded_len {
+            best_url = format!("{base_prefix}{encoded_candidate}");
+            if mid == body_chars.len() {
+                break;
+            }
+            low = mid + 1;
+        } else {
+            if mid == 0 {
+                break;
+            }
+            high = mid - 1;
+        }
+    }
+
+    best_url
 }
 
 // ── Clipboard ───────────────────────────────────────────────────────────────
@@ -584,6 +592,17 @@ fn print_fallback(body: &str) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Replace the user's home directory prefix with `~` for privacy.
+fn redact_home_prefix(path: &str) -> String {
+    if let Some(home) = crate::utils::home_dir() {
+        let home_str = home.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
 
 /// Run a command and return its stdout as a trimmed string.
 fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
@@ -639,19 +658,50 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_install_method_cargo() {
-        // Can't fully test current_exe in unit tests, but test the logic
-        let exe = "/Users/user/.cargo/bin/vortix";
-        if exe.contains("/.cargo/bin/") {
-            assert!(true);
-        }
+    fn test_install_method_from_path() {
+        assert_eq!(
+            install_method_from_path("/Users/user/.cargo/bin/vortix"),
+            "cargo install"
+        );
+        assert_eq!(
+            install_method_from_path("/opt/homebrew/bin/vortix"),
+            "homebrew"
+        );
+        assert_eq!(
+            install_method_from_path("/usr/local/Cellar/vortix/0.1/bin/vortix"),
+            "homebrew"
+        );
+        assert_eq!(
+            install_method_from_path("/nix/store/abc-vortix/bin/vortix"),
+            "nix"
+        );
+        assert_eq!(
+            install_method_from_path("/usr/bin/vortix"),
+            "system package"
+        );
+        assert_eq!(
+            install_method_from_path("/usr/local/bin/vortix"),
+            "system package"
+        );
+        assert_eq!(
+            install_method_from_path("/home/user/vortix/target/debug/vortix"),
+            "built from source"
+        );
+        assert_eq!(
+            install_method_from_path("/home/user/vortix/target/release/vortix"),
+            "built from source"
+        );
+        assert_eq!(
+            install_method_from_path("/some/random/path/vortix"),
+            "binary"
+        );
     }
 
     #[test]
     fn test_build_github_url_within_limit() {
         let body = "## Test\n\nShort body";
         let url = build_github_url(body);
-        assert!(url.starts_with("https://github.com/Harry-kp/vortix/issues/new"));
+        assert!(url.starts_with(&format!("{}/issues/new", constants::GITHUB_REPO_URL)));
         assert!(url.len() <= constants::GITHUB_ISSUE_URL_LIMIT);
     }
 
