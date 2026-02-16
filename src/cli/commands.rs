@@ -27,6 +27,10 @@ pub fn handle_command(command: &Commands, config_dir: &Path, config_source: &str
             handle_release_killswitch();
             Ok(true)
         }
+        Commands::Report => {
+            super::report::run(config_dir, config_source);
+            Ok(true)
+        }
     }
 }
 
@@ -141,7 +145,7 @@ fn import_from_directory(dir_path: &Path) {
 /// Counts VPN profiles in a directory, split by protocol.
 ///
 /// Returns `(wireguard_count, openvpn_count)`.
-fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
+pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
     if !profiles_dir.is_dir() {
         return (0, 0);
     }
