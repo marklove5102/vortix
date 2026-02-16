@@ -118,6 +118,12 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/release
 
 Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (curl, openvpn/wireguard-tools, etc.).
 
+**Nix (flakes):**
+```bash
+nix run github:Harry-kp/vortix        # Run without installing
+nix profile install github:Harry-kp/vortix  # Install to profile
+```
+
 **From source:**
 ```bash
 git clone https://github.com/Harry-kp/vortix.git
@@ -143,6 +149,7 @@ After this, `sudo vortix` works as expected.
 - `pacman -S vortix` (Arch) — **no**, installs to `/usr/bin/`
 - `brew install` (Homebrew) — **no**, installs to Homebrew prefix
 - `npm install -g` (npm) — **no**, installs to npm global bin
+- Nix (`nix profile install`) — **no**, installs to Nix profile bin
 - macOS — **no**, sudo preserves user PATH
 
 ## Usage
@@ -152,6 +159,7 @@ sudo vortix              # Launch TUI (requires root for VPN operations)
 vortix import <file>     # Import a .conf or .ovpn profile
 vortix info              # Show config directory and version
 vortix update            # Self-update to latest release
+vortix report            # Generate a bug report with system diagnostics
 ```
 
 ### Keybindings
@@ -336,6 +344,11 @@ See the [project board](https://github.com/users/Harry-kp/projects/6) for what's
 cargo build         # Build binary
 cargo test          # Run unit/integration tests
 cargo clippy        # Enforce code quality (Fail-fast via pre-commit)
+```
+
+**Nix users** can enter a development shell with all Rust tooling pre-configured:
+```bash
+nix develop
 ```
 
 ## Featured In
